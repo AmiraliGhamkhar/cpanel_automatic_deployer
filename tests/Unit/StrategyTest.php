@@ -25,7 +25,9 @@ class StrategyTest extends TestCase
         ) {
             $this->assertInstanceOf($class, $r->for($key));
         }
-        $p = new Project(["settings" => ["migrations" => false]]);
+        // Avoid mass-assignment schema inspection: strategy selection needs no database.
+        $p = new Project();
+        $p->settings = ["migrations" => false];
         $this->assertNotContains("migrate", $r->for("laravel")->steps($p));
         $p->settings = ["migrations" => true];
         $this->assertContains("migrate", $r->for("laravel")->steps($p));

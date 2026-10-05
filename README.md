@@ -2,7 +2,7 @@
 
 A personal, self-hosted Laravel 12 + Filament 3 control plane for heterogeneous cPanel accounts. The panel runs separately from the managed hosting accounts. No bot, SPA, Docker requirement, WHM, root access, Redis or systemd dependency on targets.
 
-> **Implementation status:** this is the initial implementation, not a production-certified release. The starting repository contained only a README. PHP syntax and the dependency-free security checks have been executed; the Laravel/Filament application and PHPUnit suite have **not** been executed in this sandbox because native PHP/Composer and dependency downloads are unavailable. No live cPanel account has been tested. The complete requested acceptance workflow is therefore **not yet verified**. See the limitations below before connecting production credentials.
+> **Implementation status:** this is the initial implementation, not a production-certified release. The starting repository contained only a README. PHP syntax and the dependency-free security checks were executed in the original sandbox. The full PHPUnit suite is now also exercised in GitHub Actions, including HTTP feature tests; see the latest CI result. Native PHP/Composer and dependency downloads remain unavailable in this sandbox, and browser/Livewire interaction testing remains outstanding. No live cPanel account has been tested. The complete requested acceptance workflow is therefore **not yet verified**. See the limitations below before connecting production credentials.
 
 ## Implemented scope
 
@@ -88,7 +88,7 @@ composer test
 
 PHPUnit uses an isolated in-memory SQLite database and mocked remote adapters. Never point tests at production. CI installs dependencies on PHP 8.4 and runs both suites. Test source covers authorization, confirmation, encryption/serialization, invalid repository inputs, shell-injection prevention, strategy selection, optional capabilities, health-gated success, state transitions and rollback selection. A real-provider staging rehearsal is still required; mocks cannot establish provider compatibility.
 
-Executed here: **30 security smoke checks passed** and **PHP syntax parsing passed** through a temporary PHP WebAssembly runtime. PHPUnit and browser integration tests remain unrun, not passing by implication.
+Executed here: **30 security smoke checks passed** and **PHP syntax parsing passed** through a temporary PHP WebAssembly runtime. The full PHPUnit suite is subsequently exercised in GitHub Actions; consult its reported results. Browser interaction and live-provider integration tests remain unrun.
 
 ## Documentation
 

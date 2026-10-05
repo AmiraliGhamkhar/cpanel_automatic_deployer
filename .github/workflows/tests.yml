@@ -16,6 +16,6 @@ jobs:
       - run: composer validate --strict
       - run: php tests/security-smoke.php
       - run: composer test -- --log-junit test-results.xml
-      - name: Annotate test failures
-        if: failure()
+      - name: Report PHPUnit results
+        if: always()
         run: php tests/report-ci.php test-results.xml

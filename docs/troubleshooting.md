@@ -31,4 +31,4 @@ Do not run `queue:retry all` for deployment jobs. They are intentionally single-
 
 ## Validation remaining
 
-Composer dependencies could not be resolved in the implementation sandbox. Run `composer install`, `composer test`, and a real browser/Livewire smoke test before using production secrets. Check published Filament assets and login routes. Generate a lockfile only after successful resolution. Test at least one disposable Iranian hosting account; its jail, PATH, quota, symlink and Passenger behavior cannot be verified by mocks.
+Composer dependencies could not be resolved in the implementation sandbox, but dependency installation and the PHPUnit suite now run in GitHub Actions. Check the latest CI results, then run `composer install`, `composer test`, and a real browser/Livewire smoke test in your deployment environment before using production secrets. Check published Filament assets and login routes. Generate a lockfile only after successful resolution. Test at least one disposable Iranian hosting account; its jail, PATH, quota, symlink and Passenger behavior cannot be verified by mocks.

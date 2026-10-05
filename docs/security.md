@@ -26,4 +26,4 @@ HTTPS health checks reject internal addresses; unusual provider networks, aliase
 
 ## Pre-production review
 
-Resolve and pin Composer dependencies; run PHPUnit/CI, dependency audit and browser/Livewire tests; verify policies on every resource/action; inspect server secret edit payloads; rehearse concurrent requests, worker timeouts and post-activation health failures against a disposable target. Verify the recovery process and provider database backups. Full application/integration verification has not yet been performed in the implementation environment.
+Resolve and pin Composer dependencies; run PHPUnit/CI, dependency audit and browser/Livewire tests; verify policies on every resource/action; inspect server secret edit payloads; rehearse concurrent requests, worker timeouts and post-activation health failures against a disposable target. Verify the recovery process and provider database backups. PHPUnit HTTP feature and safety tests run in GitHub Actions; full browser/Livewire interaction and live-provider integration verification remain outstanding.
