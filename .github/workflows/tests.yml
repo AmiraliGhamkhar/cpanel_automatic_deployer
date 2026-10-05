@@ -9,7 +9,7 @@ permissions:
 # second parallel job starves until the 15-minute acquisition timeout kills it.
 jobs:
   php:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
