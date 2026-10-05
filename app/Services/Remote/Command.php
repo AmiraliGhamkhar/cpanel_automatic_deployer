@@ -3,7 +3,12 @@ namespace App\Services\Remote;
 use App\Services\Security\Input;
 final class Command
 {
-    private function __construct(public readonly string $shell) {}
+    public const DEFAULT_LABEL = "remote command";
+
+    private function __construct(
+        public readonly string $shell,
+        public readonly string $label = self::DEFAULT_LABEL,
+    ) {}
     private static function q(string $v): string
     {
         return escapeshellarg($v);
@@ -30,6 +35,22 @@ final class Command
         }
         return new self($probes[$name]);
     }
+    /**
+     * Look for a configured application process owned by the account.
+     *
+     * The pattern is validated as a literal and quoted; grep receives it as a
+     * fixed string. A missing process surfaces as a non-zero exit status.
+     */
+    public static function processCheck(string $pattern): self
+    {
+        Input::processPattern($pattern);
+        return new self(
+            'ps -u $(id -un) -o args= 2>/dev/null | grep -q -F -- ' .
+                self::q($pattern),
+            "Check application process",
+        );
+    }
+
     public static function initialize(
         string $base,
         int $id,
@@ -49,6 +70,7 @@ final class Command
         return new self(
             implode(" && ", $checks) .
                 " && mkdir -p -- $q && test \"$(cd $q && pwd -P)\" = $q && (test -f $marker || (test -z \"$(ls -A -- $q)\" && touch -- $marker))",
+            "Initialize project directory",
         );
     }
     public static function prepare(string $base, int $id): self
@@ -61,6 +83,7 @@ final class Command
             "test -f " .
                 self::q($base . "/.control-project-" . $id) .
                 " && test ! -L $r && test ! -L $s && test ! -L $b && mkdir -p -- $r $s $b && chmod 700 -- $s $b",
+            "Prepare release directories",
         );
     }
     public static function clone(
@@ -88,6 +111,7 @@ final class Command
                 self::q("origin/" . $branch) .
                 " && git checkout --detach " .
                 self::q($sha),
+            "Clone repository",
         );
     }
     public static function install(string $release, string $operation): self
@@ -117,6 +141,7 @@ final class Command
                 self::q($release) .
                 " && timeout 300 sh -c " .
                 self::q($ops[$operation]),
+            "Run " . $operation,
         );
     }
     public static function linkEnvironment(string $base, string $release): self
@@ -130,6 +155,7 @@ final class Command
                 self::q($base . "/shared/.env") .
                 " " .
                 self::q($release . "/.env"),
+            "Link environment file",
         );
     }
     public static function removeGitMetadata(string $release): self
@@ -150,6 +176,7 @@ final class Command
                 self::q($release . "/.git") .
                 " && rm -rf -- " .
                 self::q($release . "/.git"),
+            "Remove Git metadata",
         );
     }
     public static function storage(string $base, string $release): self
@@ -182,6 +209,7 @@ final class Command
                 $storage .
                 " " .
                 $target,
+            "Link persistent storage",
         );
     }
     public static function activate(
@@ -205,6 +233,7 @@ final class Command
                 " && test ! -e .current-next && test ! -L .current-next && ln -s -- " .
                 self::q($relative) .
                 " .current-next && mv -Tf -- .current-next current",
+            "Activate release",
         );
     }
     public static function archive(
@@ -220,6 +249,7 @@ final class Command
                 " -C " .
                 self::q($release) .
                 " .",
+            "Create release archive",
         );
     }
 }

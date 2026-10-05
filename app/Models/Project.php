@@ -23,6 +23,28 @@ class Project extends Model
             "current_deployment_id" => "integer",
         ];
     }
+    /** Read a deployment setting with a default, keeping settings access consistent. */
+    public function setting(string $key, mixed $default = null): mixed
+    {
+        $settings = $this->settings ?? [];
+        return array_key_exists($key, $settings) && $settings[$key] !== null
+            ? $settings[$key]
+            : $default;
+    }
+
+    /**
+     * Absolute path the provider must serve.
+     *
+     * Symlink releases expose `<path>/current`; in-place releases are copied
+     * into a real `<path>/app` directory because some hosts do not follow
+     * symlinks reliably.
+     */
+    public function livePath(): string
+    {
+        return $this->remote_path .
+            ($this->release_strategy === "in_place" ? "/app" : "/current");
+    }
+
     public function server()
     {
         return $this->belongsTo(Server::class);

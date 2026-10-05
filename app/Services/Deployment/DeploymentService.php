@@ -294,9 +294,19 @@ class DeploymentService
             "Apply restart strategy",
             fn() => $this->restart($p),
         );
-        $this->log->step($d, "Verify HTTPS health check", function () use ($p) {
-            if (!$this->health->check($p->health_check_url)) {
-                throw new RuntimeException("Health check failed.");
+        $this->log->step($d, "Verify configured health check", function () use (
+            $p,
+        ) {
+            $result = $this->health->check($p, $this->ssh);
+            // Record the probe on the project so the UI never shows a stale verdict.
+            Project::whereKey($p->id)->update([
+                "health_checked_at" => now(),
+                "health_check_message" => mb_substr($result->message, 0, 500),
+            ]);
+            if (!$result->passed) {
+                throw new RuntimeException(
+                    "Health check failed: " . $result->message,
+                );
             }
         });
         DB::transaction(function () use ($d, $p) {
@@ -316,6 +326,19 @@ class DeploymentService
             );
         });
     }
+    /** Short, first-party failure summary for lists; detail lives in failure_detail. */
+    public function failureSummary(Deployment $d): string
+    {
+        if ($d->failure_step) {
+            return mb_substr(
+                "Failed step: " . $d->failure_step . ".",
+                0,
+                250,
+            );
+        }
+        return "Deployment failed before a step reported a reason. Inspect the log, provider limits and the queue worker.";
+    }
+
     public function writeEnvironment(Project $p): void
     {
         $this->ssh->upload(
@@ -344,8 +367,9 @@ class DeploymentService
                 "duration" => $d->started_at
                     ? (int) $d->started_at->diffInSeconds(now())
                     : 0,
-                "failure_reason" =>
-                    "Deployment failed. See the last failed step; verify provider limits, runtime and health endpoint.",
+                "failure_reason" => $this->failureSummary($d),
+                // A release was switched but is not healthy: offer the way back.
+                "rollback_available" => $d->previous_release_path !== null,
             ]);
             Project::whereKey($d->project_id)
                 ->where("active_deployment_id", $id)

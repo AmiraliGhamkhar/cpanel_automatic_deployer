@@ -7,6 +7,9 @@ use phpseclib3\Crypt\PublicKeyLoader;
 use RuntimeException;
 class SshService implements SshServiceInterface
 {
+    /** Output is capped in memory; the log layer truncates further before storing. */
+    private const MAX_OUTPUT_BYTES = 65536;
+
     private SFTP $client;
     public function __construct(private PublicHttp $network) {}
     public function connect(Server $server): void
@@ -62,32 +65,50 @@ class SshService implements SshServiceInterface
             );
         }
     }
+    /**
+     * Execute an allowlisted command template.
+     *
+     * Exit-status failures are reported as RemoteCommandFailed with the
+     * captured output attached so the deployment log can store a sanitized,
+     * truncated copy. Transport timeouts deliberately carry no output.
+     */
     public function run(Command $command): string
     {
+        $label = $command->label === Command::DEFAULT_LABEL
+            ? mb_substr(preg_replace('/\s+/', ' ', $command->shell) ?? $command->shell, 0, 120)
+            : $command->label;
         try {
             $output = "";
             $result = $this->client->exec(
                 "umask 077; ( " . $command->shell . " ) 2>&1",
                 function ($chunk) use (&$output) {
-                    $remaining = 65536 - strlen($output);
+                    $remaining = self::MAX_OUTPUT_BYTES - strlen($output);
                     if ($remaining > 0) {
                         $output .= substr($chunk, 0, $remaining);
                     }
                 },
             );
-            if (
-                $result === false ||
-                $this->client->isTimeout() ||
-                $this->client->getExitStatus() !== 0
-            ) {
-                throw new RuntimeException();
-            }
-            return substr($output, 0, 65536);
         } catch (\Throwable) {
             throw new RuntimeException(
-                "Remote operation failed or timed out. Inspect the runtime, permissions and provider limits on the host. Raw output was withheld to protect secrets.",
+                "Remote operation failed while executing " . $label .
+                    ". Verify connectivity, the pinned host key and provider SSH limits.",
             );
         }
+        if ($result === false || $this->client->isTimeout()) {
+            throw new RuntimeException(
+                "Remote operation timed out while executing " . $label .
+                    ". Shared hosts may cap command duration; check the provider limits and retry.",
+            );
+        }
+        $status = (int) $this->client->getExitStatus();
+        if ($status !== 0) {
+            throw new RemoteCommandFailed(
+                substr($output, 0, self::MAX_OUTPUT_BYTES),
+                $status,
+                $label,
+            );
+        }
+        return substr($output, 0, self::MAX_OUTPUT_BYTES);
     }
     public function exists(string $path): bool
     {

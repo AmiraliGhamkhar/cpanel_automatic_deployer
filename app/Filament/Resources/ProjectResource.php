@@ -85,8 +85,36 @@ class ProjectResource extends Resource
                         ->required()
                         ->placeholder("https://example.com/health")
                         ->helperText(
-                            "Mandatory public HTTPS endpoint returning HTTP 200. Redirects are rejected.",
+                            "Mandatory public HTTPS endpoint. The host is also the target of TCP and process checks.",
                         ),
+                    F\Select::make("settings.health_type")
+                        ->label("Health check type")
+                        ->options([
+                            "http" => "HTTPS request (expects HTTP 200)",
+                            "tcp" => "TCP connect to the health host",
+                            "process" => "Application process on the host (SSH)",
+                        ])
+                        ->default("http")
+                        ->required(),
+                    F\TextInput::make("settings.health_port")
+                        ->label("TCP port (TCP checks only)")
+                        ->numeric()
+                        ->helperText(
+                            "Leave empty to use the port from the health URL, or 443.",
+                        ),
+                    F\TextInput::make("settings.health_process")
+                        ->label("Process pattern (process checks only)")
+                        ->helperText(
+                            "A literal fragment of the process command line, e.g. passenger_wsgi or node app.js. Letters, digits, spaces, dots, slashes, underscores and hyphens only.",
+                        ),
+                    F\TextInput::make("settings.health_attempts")
+                        ->label("Health attempts (1-5)")
+                        ->numeric()
+                        ->default(3),
+                    F\TextInput::make("settings.health_delay")
+                        ->label("Seconds between attempts (0-30)")
+                        ->numeric()
+                        ->default(2),
                     F\Select::make("settings.restart")
                         ->options([
                             "none" => "None (PHP/static)",

@@ -82,6 +82,26 @@ final class Input
         }
         return $value;
     }
+    /**
+     * A literal fragment used to look for a running process.
+     *
+     * Only plain characters are accepted and the value is always quoted with
+     * escapeshellarg downstream, so it can never become a shell fragment.
+     */
+    public static function processPattern(string $value): string
+    {
+        if (
+            !preg_match("/\\A[A-Za-z0-9][A-Za-z0-9 ._\\/-]{2,119}\\z/D", $value) ||
+            str_contains($value, "..") ||
+            str_contains($value, "//")
+        ) {
+            throw new InvalidArgumentException(
+                "Process patterns allow letters, digits, spaces, dots, underscores, slashes and hyphens only.",
+            );
+        }
+        return $value;
+    }
+
     public static function env(array $values): array
     {
         if (

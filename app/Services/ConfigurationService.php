@@ -123,6 +123,14 @@ class ConfigurationService
             "settings.migrations" => "boolean",
             "settings.build" => "boolean",
             "settings.restart" => ["required", Rule::in(["none", "passenger"])],
+            "settings.health_type" => [
+                "nullable",
+                Rule::in(["http", "tcp", "process"]),
+            ],
+            "settings.health_port" => "nullable|integer|min:1|max:65535",
+            "settings.health_process" => "nullable|string|max:120",
+            "settings.health_attempts" => "nullable|integer|min:1|max:5",
+            "settings.health_delay" => "nullable|integer|min:0|max:30",
             "enabled" => "boolean",
         ])->validate();
         $server = Server::findOrFail($data["server_id"]);
@@ -146,8 +154,31 @@ class ConfigurationService
         }
         $data["settings"] = array_intersect_key(
             $data["settings"] ?? [],
-            array_flip(["migrations", "build", "restart"]),
+            array_flip([
+                "migrations",
+                "build",
+                "restart",
+                "health_type",
+                "health_port",
+                "health_process",
+                "health_attempts",
+                "health_delay",
+            ]),
         );
+        if (
+            ($data["settings"]["health_type"] ?? "http") === "process" &&
+            !empty($data["settings"]["health_process"])
+        ) {
+            Input::processPattern($data["settings"]["health_process"]);
+        }
+        if (
+            ($data["settings"]["health_type"] ?? "http") === "process" &&
+            empty($data["settings"]["health_process"])
+        ) {
+            throw new \RuntimeException(
+                "A process health check requires the process pattern to look for.",
+            );
+        }
         return DB::transaction(function () use ($data, $record) {
             Server::lockForUpdate()->findOrFail($data["server_id"]);
             foreach (
