@@ -7,6 +7,11 @@ class PythonDeploymentStrategy implements DeploymentStrategy
     {
         return ["git", "python", "pip", "timeout"];
     }
+
+    public function verificationCandidates(): array
+    {
+        return ["requirements.txt", "pyproject.toml"];
+    }
     public function steps(Project $project, bool $hasRequirements = true): array
     {
         return [

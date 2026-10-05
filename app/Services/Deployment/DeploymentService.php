@@ -46,6 +46,8 @@ class DeploymentService
         if (!in_array($kind, ["deploy", "rollback"], true)) {
             throw new RuntimeException("Invalid operation.");
         }
+        // Release an operation abandoned by a dead worker before reporting busy.
+        app(\App\Services\Operations\StaleOperationReaper::class)->reap($project);
         return DB::transaction(function () use (
             $project,
             $user,
@@ -97,9 +99,14 @@ class DeploymentService
                 "This host mode is inspection-only; SSH deployment is required.",
             );
         }
-        if ($p->release_strategy !== "symlink") {
+        if (!in_array($p->release_strategy, ["symlink", "in_place"], true)) {
             throw new RuntimeException(
-                "In-place deployment is not implemented safely. Use a provider-supported symlink document root.",
+                "Unknown release strategy. Use symlink releases or an in-place copy.",
+            );
+        }
+        if ($p->release_strategy === "in_place" && $p->public_path !== null) {
+            throw new RuntimeException(
+                "In-place releases serve the deployment directory directly; a public subdirectory hint is not supported. Remove the public path or use symlink releases.",
             );
         }
         if ($p->project_type === "static" && !empty($p->environment_config)) {
@@ -121,7 +128,10 @@ class DeploymentService
             );
         }
         $required = array_merge(
-            ["ssh", "sftp", "symlink"],
+            ["ssh", "sftp"],
+            $p->release_strategy === "symlink"
+                ? ["symlink"]
+                : ["tar", "timeout"],
             $this->strategies->for($p->project_type)->requirements(),
         );
         if ($p->settings["build"] ?? false) {
@@ -282,11 +292,38 @@ class DeploymentService
                 );
             }
         }
+        $candidates = $this->strategies
+            ->for($p->project_type)
+            ->verificationCandidates();
+        if ($candidates !== []) {
+            // Verified while the previous release is still serving.
+            $this->log->step(
+                $d,
+                "Verify release contents",
+                fn() => $this->ssh->run(Command::verifyRelease($release, $candidates)),
+            );
+        }
+
+        $inPlace = $p->release_strategy === "in_place";
         $this->log->step(
             $d,
-            "Activate release",
-            fn() => $this->ssh->run(Command::activate($base, $release, $p->id)),
+            $inPlace ? "Activate in-place release" : "Activate release",
+            fn() => $this->ssh->run(
+                $inPlace
+                    ? Command::inPlaceActivate($base, $release, $p->id, $d->id)
+                    : Command::activate($base, $release, $p->id),
+            ),
         );
+        if ($inPlace && $candidates !== []) {
+            // The live directory is what the provider serves: verify the copy.
+            $this->log->step(
+                $d,
+                "Verify deployed files",
+                fn() => $this->ssh->run(
+                    Command::verifyRelease($p->livePath(), $candidates),
+                ),
+            );
+        }
         // Track the actual filesystem switch even when the subsequent health check fails.
         $p->update(["current_deployment_id" => $d->id]);
         $this->log->step(
@@ -349,9 +386,7 @@ class DeploymentService
     public function restart(Project $p): void
     {
         if (($p->settings["restart"] ?? "none") === "passenger") {
-            $this->ssh->run(
-                Command::install($p->remote_path . "/current", "passenger"),
-            );
+            $this->ssh->run(Command::install($p->livePath(), "passenger"));
         }
     }
     public function fail(int $id): void

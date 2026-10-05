@@ -56,10 +56,13 @@ class ProjectResource extends Resource
                         ->required(),
                     F\Select::make("release_strategy")
                         ->options([
-                            "symlink" => "Atomic symlink releases",
-                            "in_place" => "In-place (blocked for safety)",
+                            "symlink" => "Atomic symlink releases (preferred)",
+                            "in_place" => "In-place copy (hosts that do not follow symlinks)",
                         ])
                         ->default("symlink")
+                        ->helperText(
+                            "In-place releases archive the live directory before overwriting it, so rollback can copy an older release back.",
+                        )
                         ->required(),
                     F\TextInput::make("remote_path")
                         ->required()

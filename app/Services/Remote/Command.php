@@ -212,6 +212,64 @@ final class Command
             "Link persistent storage",
         );
     }
+    /**
+     * At least one of the given repository files must exist in the tree.
+     *
+     * Used before a release goes live so an empty or wrong checkout is caught
+     * while the previous release is still serving.
+     */
+    public static function verifyRelease(string $path, array $files): self
+    {
+        Input::path($path);
+        if ($files === []) {
+            throw new \InvalidArgumentException("Nothing to verify");
+        }
+        $checks = [];
+        foreach ($files as $file) {
+            $checks[] = "test -f " . self::q($path . "/" . Input::filename($file));
+        }
+        return new self(
+            "( " . implode(" || ", $checks) . " )",
+            "Verify deployed files",
+        );
+    }
+
+    /**
+     * In-place activation for hosts where a symlinked document root is not
+     * reliable.
+     *
+     * The live directory is archived first and the archive must succeed before
+     * anything is deleted. The release is then copied over the real directory,
+     * so rollback can copy an older release back in the same way.
+     */
+    public static function inPlaceActivate(
+        string $base,
+        string $release,
+        int $projectId,
+        int $deploymentId,
+    ): self {
+        Input::path($base);
+        $relative = substr($release, strlen($base) + 1);
+        if (!preg_match("~\\Areleases/[0-9]+\\z~D", $relative)) {
+            throw new \InvalidArgumentException("Invalid release path");
+        }
+        $source = self::q($release);
+        $app = self::q($base . "/app");
+        $marker = self::q($base . "/.control-project-" . $projectId);
+        $backups = self::q($base . "/backups");
+        $archive = self::q($base . "/backups/inplace-" . $deploymentId . ".tar.gz");
+        return new self(
+            "test -d $source && test ! -L $source && test -f $marker" .
+                " && test ! -L $app && test -d $backups && test ! -L $backups" .
+                " && ( test ! -d $app || test -z \"$(ls -A -- $app)\" || ( test ! -e $archive && umask 077 && timeout 300 tar --exclude=.env -czf $archive -C $app . ) )" .
+                " && mkdir -p -- $app && test ! -L $app" .
+                " && find $app -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +" .
+                " && cp -a -- $source/. $app/" .
+                " && test -n \"$(ls -A -- $app)\"",
+            "Activate in-place release",
+        );
+    }
+
     public static function activate(
         string $base,
         string $release,

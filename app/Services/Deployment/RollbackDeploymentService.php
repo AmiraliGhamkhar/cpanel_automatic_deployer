@@ -14,7 +14,7 @@ class RollbackDeploymentService
             ->first();
         if (
             !$d ||
-            $p->release_strategy !== "symlink" ||
+            !in_array($p->release_strategy, ["symlink", "in_place"], true) ||
             !preg_match(
                 "~\A" .
                     preg_quote($p->remote_path, "~") .

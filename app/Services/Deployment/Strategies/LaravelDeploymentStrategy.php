@@ -7,6 +7,11 @@ class LaravelDeploymentStrategy implements DeploymentStrategy
     {
         return ["git", "php", "composer", "timeout"];
     }
+
+    public function verificationCandidates(): array
+    {
+        return ["artisan"];
+    }
     public function steps(Project $project, bool $hasRequirements = true): array
     {
         $steps = [

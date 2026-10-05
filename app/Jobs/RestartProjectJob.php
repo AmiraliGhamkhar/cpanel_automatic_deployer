@@ -63,9 +63,7 @@ class RestartProjectJob implements ShouldQueue
                     $p->environment_config ?? [],
                 ),
             );
-            $ssh->run(
-                Command::install($p->remote_path . "/current", "passenger"),
-            );
+            $ssh->run(Command::install($p->livePath(), "passenger"));
             $ok = $health->check($p, $ssh)->passed;
         } catch (\Throwable) {
         } finally {

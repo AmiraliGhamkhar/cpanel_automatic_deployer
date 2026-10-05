@@ -7,6 +7,11 @@ class CustomDeploymentStrategy implements DeploymentStrategy
     {
         return [];
     }
+    public function verificationCandidates(): array
+    {
+        return [];
+    }
+
     public function steps(Project $project, bool $hasRequirements = true): array
     {
         throw new \RuntimeException(

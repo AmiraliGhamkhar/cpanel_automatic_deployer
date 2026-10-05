@@ -7,6 +7,11 @@ class NodeDeploymentStrategy implements DeploymentStrategy
     {
         return ["git", "node", "npm", "timeout"];
     }
+
+    public function verificationCandidates(): array
+    {
+        return ["package.json"];
+    }
     public function steps(Project $project, bool $hasRequirements = true): array
     {
         $steps = ["Install locked Node dependencies" => "npm"];

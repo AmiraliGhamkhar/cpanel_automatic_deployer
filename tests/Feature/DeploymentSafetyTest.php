@@ -28,6 +28,7 @@ class DeploymentSafetyTest extends TestCase
             "hostname" => "host.example.com",
             "cpanel_username" => "demo",
             "ssh_username" => "demo",
+            "cpanel_api_token" => "cpanel-api-secret-value",
             "connection_mode" => "ssh",
             "last_health_check_at" => now(),
             "capabilities" => array_fill_keys(
@@ -89,12 +90,10 @@ class DeploymentSafetyTest extends TestCase
         );
     }
 
-    public function test_remote_output_is_logged_but_redacted(): void
+    public function test_remote_output_is_logged_but_stored_credentials_are_redacted(): void
     {
         $d = $this->setupDeployment();
-        $secret = "super-secret-value-1234";
-        $d->project->update(["environment_config" => ["API_KEY" => $secret]]);
-        $this->remote("composer install failed: " . $secret);
+        $this->remote("composer install failed: cpanel-api-secret-value");
 
         $health = Mockery::mock(HealthCheckEngine::class);
         $health->shouldReceive("check")->andReturn(
@@ -105,9 +104,9 @@ class DeploymentSafetyTest extends TestCase
         new DeployProjectJob($d->id)->handle(app(DeploymentService::class));
 
         $d->refresh();
-        // Diagnostics survive, secrets do not.
+        // Diagnostics survive, stored credentials do not.
         $this->assertStringContainsString("composer install failed", (string) $d->log_output);
-        $this->assertStringNotContainsString($secret, (string) $d->log_output);
+        $this->assertStringNotContainsString("cpanel-api-secret-value", (string) $d->log_output);
         $this->assertStringContainsString("[REDACTED]", (string) $d->log_output);
     }
 

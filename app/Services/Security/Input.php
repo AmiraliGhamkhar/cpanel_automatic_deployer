@@ -82,6 +82,15 @@ final class Input
         }
         return $value;
     }
+    /** A repository file name used for release verification. */
+    public static function filename(string $value): string
+    {
+        if (!preg_match("/\\A[A-Za-z0-9][A-Za-z0-9._-]{0,80}\\z/D", $value)) {
+            throw new InvalidArgumentException("Invalid release file name.");
+        }
+        return $value;
+    }
+
     /**
      * A literal fragment used to look for a running process.
      *

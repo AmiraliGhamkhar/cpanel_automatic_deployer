@@ -18,6 +18,7 @@ class ProjectOperations
             throw new \RuntimeException("Confirmation required.");
         }
         Input::env([$key => $value ?? ""]);
+        app(\App\Services\Operations\StaleOperationReaper::class)->reap($project);
         DB::transaction(function () use (
             $project,
             $user,
@@ -66,6 +67,7 @@ class ProjectOperations
                 "Confirmed supported operation required.",
             );
         }
+        app(\App\Services\Operations\StaleOperationReaper::class)->reap($project);
         DB::transaction(function () use ($project, $user, $operation) {
             \App\Models\Server::lockForUpdate()->findOrFail(
                 $project->server_id,
