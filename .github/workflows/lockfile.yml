@@ -1,0 +1,41 @@
+name: Lockfile
+
+# Dependency resolution needs packagist, which is unavailable in the sandbox
+# where this repository is developed. Run this workflow manually to generate
+# and commit composer.lock from a trusted PHP 8.4 environment.
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: Commit message for the generated lockfile
+        required: false
+        default: Add composer.lock generated on PHP 8.4
+
+permissions:
+  contents: write
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: curl, intl, mbstring, pdo_sqlite, pdo_pgsql, openssl, zip
+          coverage: none
+      - run: composer update --no-interaction --prefer-dist --no-scripts
+      - run: composer validate --strict
+      - name: Commit the lockfile
+        run: |
+          git config user.name "lockfile-bot"
+          git config user.email "lockfile-bot@users.noreply.github.com"
+          git add composer.lock
+          if git diff --cached --quiet; then
+            echo "Lockfile is unchanged."
+            exit 0
+          fi
+          git commit -m "${{ inputs.message }}"
+          git push origin "HEAD:${{ github.ref_name }}"
