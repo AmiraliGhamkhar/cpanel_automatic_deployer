@@ -107,7 +107,7 @@ class CpanelGitDeploymentTest extends TestCase
         $this->app->instance(\App\Services\HealthCheckEngine::class, $health);
     }
 
-    private function run(Deployment $deployment): void
+    private function deploy(Deployment $deployment): void
     {
         new DeployProjectJob($deployment->id)->handle(app(DeploymentService::class));
     }
@@ -124,7 +124,7 @@ class CpanelGitDeploymentTest extends TestCase
             null,
             true,
         );
-        $this->run($deployment);
+        $this->deploy($deployment);
 
         $deployment->refresh();
         $this->assertSame("success", $deployment->status);
@@ -158,7 +158,7 @@ class CpanelGitDeploymentTest extends TestCase
             null,
             true,
         );
-        $this->run($deployment);
+        $this->deploy($deployment);
 
         $deployment->refresh();
         $this->assertSame("failed", $deployment->status);

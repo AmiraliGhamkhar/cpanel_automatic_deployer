@@ -58,6 +58,15 @@ reserved destinations) is asserted separately in
 `tests/Feature/PublicHttpGuardTest.php`. Test directories
 (`/home/<user>/deploy-tests-*`) are removed in `tearDown`.
 
+## Load-time fatal guards
+
+`php tests/suite-hygiene.php` runs before the suite. It reflects the final
+methods inherited from PHPUnit's and Laravel's `TestCase` and rejects any test
+class that redeclares one (for example a helper named `run()`), because that is
+a link-time fatal: the whole PHP process dies, no test runs, the JUnit report
+stays empty and CI only shows exit code 255. It also enforces PSR-4
+name/path consistency so PHPUnit can always load every test file.
+
 ## CI
 
 `.github/workflows/tests.yml` runs both jobs on every push:

@@ -30,10 +30,10 @@ function gh(string $message, int $limit = 1200): string
 function emit(string $level, string $message, string $file = "", int $line = 0): void
 {
     if ($file !== "") {
-        fwrite(STDOUT, "::{$level} file={$file},line={$line}::" . gh($message) . "\n");
+        echo "::{$level} file={$file},line={$line}::" . gh($message) . "\n";
         return;
     }
-    fwrite(STDOUT, "::{$level}::" . gh($message) . "\n");
+    echo "::{$level}::" . gh($message) . "\n";
 }
 
 /**
@@ -156,13 +156,13 @@ $fatalLines = annotateFatalLines((string) $logPath);
 
 if ($result["readable"]) {
     $summary = "PHPUnit: " . ($result["tests"] - $result["bad"] - $result["skipped"]) . " passed, " . $result["bad"] . " failed, " . $result["skipped"] . " skipped, " . $result["tests"] . " total";
-    fwrite(STDOUT, $summary . "\n");
+    echo $summary . "\n";
     if (getenv("GITHUB_ACTIONS") === "true") {
         emit("notice", $summary);
     }
 } else {
     $summary = "PHPUnit produced no usable JUnit report (missing, empty or truncated): the process most likely died. " . $fatalLines . " fatal line(s) annotated.";
-    fwrite(STDOUT, $summary . "\n");
+    echo $summary . "\n";
     if (getenv("GITHUB_ACTIONS") === "true") {
         emit("error", $summary);
     }

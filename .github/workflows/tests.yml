@@ -43,6 +43,8 @@ jobs:
           QUEUE_CONNECTION: database
           CACHE_STORE: database
           SESSION_SECURE_COOKIE: 'false'
+      - name: Suite hygiene (load-time fatal guards)
+        run: php tests/suite-hygiene.php
       - name: Control-plane test suite
         run: composer test -- --log-junit test-results.xml 2>&1 | tee phpunit-output.log
       - name: Report control-plane results
@@ -80,4 +82,9 @@ jobs:
         run: php vendor/bin/phpunit --testsuite Integration --log-junit integration-results.xml 2>&1 | tee phpunit-integration.log
       - name: Report integration results
         if: always()
-        run: php tests/report-ci.php integration-results.xml phpunit-integration.log
+        run: |
+          if [ -f integration-results.xml ] || [ -f phpunit-integration.log ]; then
+            php tests/report-ci.php integration-results.xml phpunit-integration.log
+          else
+            echo "The integration suite did not run; nothing to report."
+          fi
