@@ -1,23 +1,12 @@
 <?php
-namespace App\Services\Deployment\Strategies;
-use App\Models\Project;
-class PythonDeploymentStrategy implements DeploymentStrategy
-{
-    public function requirements(): array
-    {
-        return ["git", "python", "pip", "timeout"];
-    }
 
-    public function verificationCandidates(): array
+namespace App\Services\Deployment\Strategies;
+
+/** Virtual environment plus requirements.txt or pyproject.toml installation. */
+class PythonDeploymentStrategy extends ConfigurableStrategy
+{
+    protected function type(): string
     {
-        return ["requirements.txt", "pyproject.toml"];
-    }
-    public function steps(Project $project, bool $hasRequirements = true): array
-    {
-        return [
-            "Create virtual environment and install dependencies" => $hasRequirements
-                ? "python"
-                : "pyproject",
-        ];
+        return "python";
     }
 }

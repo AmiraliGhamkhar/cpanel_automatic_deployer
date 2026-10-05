@@ -36,6 +36,11 @@ class RollbackDeploymentService
         bool $confirmed,
     ): Deployment {
         Gate::forUser($u)->authorize("deploy", $p);
+        if ($p->deployment_mode !== "ssh") {
+            throw new \RuntimeException(
+                "cPanel Git deployments are owned by cPanel and cannot be pinned to a commit. Roll back in cPanel's Git interface or switch this project to SSH releases.",
+            );
+        }
         if (!$confirmed) {
             throw new \RuntimeException(
                 "Rollback confirmation is required. Databases are not rolled back.",

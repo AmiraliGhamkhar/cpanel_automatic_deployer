@@ -12,7 +12,7 @@ class CapabilityDetector
     {
         $result = [];
         foreach (
-            ["account", "domains", "disk", "databases", "git", "applications"]
+            ["account", "domains", "disk", "databases", "applications"]
             as $feature
         ) {
             $result["cpanel_" . $feature] = $this->cpanel->inspect(
@@ -20,6 +20,9 @@ class CapabilityDetector
                 $feature,
             );
         }
+        // Git Version Control is reported separately: it is what cpanel_git
+        // deployment mode depends on.
+        $result["cpanel_git"] = $this->cpanel->inspect($server, "git");
         $names = [
             "ssh",
             "sftp",

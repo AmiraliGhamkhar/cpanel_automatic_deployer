@@ -31,6 +31,11 @@ class DeploymentService
         Input::branch($branch);
         if ($sha) {
             Input::commit($sha);
+            if ($project->deployment_mode !== "ssh") {
+                throw new RuntimeException(
+                    "cPanel Git deployments always take the latest commit on the branch; deploy a pinned commit with SSH releases.",
+                );
+            }
         }
         return $this->queue($project, $user, "deploy", $branch, $sha, null);
     }
@@ -101,22 +106,10 @@ class DeploymentService
         }
         Input::repository($p->repository_url);
         Input::branch($p->branch);
-        Input::path($p->remote_path, $s->ssh_username);
-        if ($p->deployment_mode !== "ssh") {
-            throw new RuntimeException(
-                "This host mode is inspection-only; SSH deployment is required.",
-            );
-        }
-        if (!in_array($p->release_strategy, ["symlink", "in_place"], true)) {
-            throw new RuntimeException(
-                "Unknown release strategy. Use symlink releases or an in-place copy.",
-            );
-        }
-        if ($p->release_strategy === "in_place" && $p->public_path !== null) {
-            throw new RuntimeException(
-                "In-place releases serve the deployment directory directly; a public subdirectory hint is not supported. Remove the public path or use symlink releases.",
-            );
-        }
+        Input::path(
+            $p->remote_path,
+            $s->ssh_username ?? $s->cpanel_username,
+        );
         if ($p->project_type === "static" && !empty($p->environment_config)) {
             throw new RuntimeException(
                 "Static projects must not publish managed secrets. Remove environment values before deploying.",
@@ -133,6 +126,48 @@ class DeploymentService
         ) {
             throw new RuntimeException(
                 "Run Test Connection first; capability results must be less than 24 hours old.",
+            );
+        }
+
+        // cPanel Git Version Control: no SSH, no release directory, provider
+        // owns the checkout and the file layout.
+        if ($p->deployment_mode === "cpanel_git") {
+            if (
+                !in_array(
+                    $s->connection_mode,
+                    ["cpanel_api", "cpanel_api_and_ssh"],
+                    true,
+                ) ||
+                !$s->cpanel_api_token
+            ) {
+                throw new RuntimeException(
+                    "cPanel Git mode requires a cPanel API token for this server.",
+                );
+            }
+            if (
+                ($s->capabilities["cpanel_git"]["status"] ?? "") !==
+                "available"
+            ) {
+                throw new RuntimeException(
+                    "Unsupported on this host: the cPanel Git Version Control API did not respond. Run Test Connection and review the provider's UAPI permissions.",
+                );
+            }
+            return;
+        }
+
+        if ($p->deployment_mode !== "ssh") {
+            throw new RuntimeException(
+                "Unsupported deployment mode. Use SSH or cPanel Git Version Control.",
+            );
+        }
+        if (!in_array($p->release_strategy, ["symlink", "in_place"], true)) {
+            throw new RuntimeException(
+                "Unknown release strategy. Use symlink releases or an in-place copy.",
+            );
+        }
+        if ($p->release_strategy === "in_place" && $p->public_path !== null) {
+            throw new RuntimeException(
+                "In-place releases serve the deployment directory directly; a public subdirectory hint is not supported. Remove the public path or use symlink releases.",
             );
         }
         $required = array_merge(
@@ -191,6 +226,11 @@ class DeploymentService
             "Validate configuration",
             fn() => $this->validate($p),
         );
+        if ($p->deployment_mode === "cpanel_git") {
+            // cPanel owns the checkout; the panel only orchestrates and verifies.
+            app(CpanelGitDeploymentService::class)->execute($d);
+            return;
+        }
         $this->log->step(
             $d,
             "Connect with pinned SSH host key",

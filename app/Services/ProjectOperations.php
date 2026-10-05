@@ -31,6 +31,11 @@ class ProjectOperations
             throw new RuntimeException("Confirmation required.");
         }
         Input::env([$key => $value ?? ""]);
+        if ($project->deployment_mode !== "ssh") {
+            throw new RuntimeException(
+                "Environment management writes a shared file inside a release directory, which cPanel Git deployments do not have. Use SSH releases or manage configuration in the repository.",
+            );
+        }
         app(Operations\StaleOperationReaper::class)->reap($project);
 
         DB::transaction(function () use ($project, $user, $key, $value, $delete) {
@@ -98,6 +103,11 @@ class ProjectOperations
             );
         }
 
+        if ($project->deployment_mode !== "ssh") {
+            throw new RuntimeException(
+                "Backups and restarts operate on a release directory, which cPanel Git deployments do not have. Use cPanel's own tools or switch this project to SSH releases.",
+            );
+        }
         app(Operations\StaleOperationReaper::class)->reap($project);
 
         $this->claimMaintenance(

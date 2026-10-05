@@ -49,7 +49,7 @@ class ProjectResource extends Resource
                     F\Select::make("deployment_mode")
                         ->options([
                             "ssh" => "SSH",
-                            "cpanel_git" => "cPanel Git (not supported yet)",
+                            "cpanel_git" => "cPanel Git Version Control (no releases, no rollback)",
                             "custom" => "Custom (not supported yet)",
                         ])
                         ->default("ssh")
@@ -176,10 +176,43 @@ class ProjectResource extends Resource
                     ->form([
                         F\TextInput::make("branch")
                             ->default(fn(Project $record) => $record->branch)
-                            ->required(),
-                        F\TextInput::make("commit")->label(
-                            "Commit SHA (blank = latest branch commit)",
-                        ),
+                            ->required()
+                            ->live(onBlur: true),
+                        F\Select::make("commit")
+                            ->label("Commit")
+                            ->options(function (Project $record, callable $get) {
+                                if ($record->deployment_mode !== "ssh") {
+                                    return [];
+                                }
+                                try {
+                                    return app(
+                                        \App\Services\Remote\GitHubService::class,
+                                    )->recentCommits(
+                                        $record->repository_url,
+                                        (string) ($get("branch") ?: $record->branch),
+                                    );
+                                } catch (\Throwable) {
+                                    // The GitHub API may be rate limited or
+                                    // unreachable; the field simply stays empty.
+                                    return [];
+                                }
+                            })
+                            ->searchable()
+                            ->placeholder("Latest commit on the branch")
+                            ->helperText(
+                                "Loaded from GitHub. Leave empty to deploy the latest commit on the branch.",
+                            )
+                            ->visible(
+                                fn(Project $record) => $record->deployment_mode === "ssh",
+                            ),
+                        F\TextInput::make("manual_commit")
+                            ->label("Or paste a full 40-character commit SHA")
+                            ->helperText(
+                                "Overrides the selection above. Full lowercase SHA only.",
+                            )
+                            ->visible(
+                                fn(Project $record) => $record->deployment_mode === "ssh",
+                            ),
                         F\Checkbox::make("confirmed")
                             ->label(
                                 "Deploy trusted repository code; migrations may run if enabled.",
@@ -187,6 +220,11 @@ class ProjectResource extends Resource
                             ->accepted()
                             ->required(),
                     ])
+                    ->modalDescription(
+                        fn(Project $record) => $record->deployment_mode === "cpanel_git"
+                            ? "cPanel Git mode pulls the repository with cPanel's Git Version Control API and runs the repository's .cpanel.yml tasks. A commit cannot be pinned and there is no release to roll back to."
+                            : null,
+                    )
                     ->requiresConfirmation()
                     ->action(function (Project $record, array $data) {
                         ActionRunner::run(
@@ -196,7 +234,7 @@ class ProjectResource extends Resource
                                 $record,
                                 auth()->user(),
                                 $data["branch"],
-                                $data["commit"] ?: null,
+                                ($data["manual_commit"] ?? null) ?: ($data["commit"] ?: null),
                                 (bool) $data["confirmed"],
                             ),
                         );
@@ -217,6 +255,9 @@ class ProjectResource extends Resource
                         )
                         ->icon("heroicon-o-clock"),
                     A\Action::make("environment")
+                        ->visible(
+                            fn(Project $record) => $record->deployment_mode === "ssh",
+                        )
                         ->modalHeading("Write-only environment variables")
                         ->modalDescription(
                             "Values never return to the browser. Changes apply on the next deployment or supported restart. Laravel cached configuration requires a new deployment.",
@@ -263,6 +304,9 @@ class ProjectResource extends Resource
                         }),
                     A\Action::make("rollback")
                         ->color("warning")
+                        ->visible(
+                            fn(Project $record) => $record->deployment_mode === "ssh",
+                        )
                         ->form([
                             F\Select::make("target")
                                 ->label("Previous verified release")
@@ -319,6 +363,9 @@ class ProjectResource extends Resource
                             );
                         }),
                     A\Action::make("restart")
+                        ->visible(
+                            fn(Project $record) => $record->deployment_mode === "ssh",
+                        )
                         ->requiresConfirmation()
                         ->modalDescription(
                             "Rewrite the shared environment, touch the Passenger restart marker and verify health.",
@@ -336,6 +383,9 @@ class ProjectResource extends Resource
                             );
                         }),
                     A\Action::make("backup")
+                        ->visible(
+                            fn(Project $record) => $record->deployment_mode === "ssh",
+                        )
                         ->form([
                             F\Select::make("type")
                                 ->label("What to back up")
@@ -381,26 +431,46 @@ class ProjectResource extends Resource
                         ->requiresConfirmation()
                         ->action(function (Project $record) {
                             Gate::authorize("update", $record);
-                            ActionRunner::run(function () use ($record) {
+                            try {
                                 if ($record->active_deployment_id !== null) {
                                     throw new \RuntimeException(
                                         "Project is busy.",
                                     );
                                 }
-                                $type = app(
+                                $detected = app(
                                     \App\Services\Remote\GitHubService::class,
-                                )->detect(
+                                )->detectWithReason(
                                     $record->repository_url,
                                     $record->branch,
                                 );
-                                $record->update(["project_type" => $type]);
+                                $record->update(["project_type" => $detected["type"]]);
                                 \App\Services\Audit::record(
                                     "DETECT_PROJECT_TYPE",
                                     "success",
                                     $record->id,
                                     $record->server_id,
                                 );
-                            });
+                                \Filament\Notifications\Notification::make()
+                                    ->title("Detected: " . $detected["type"])
+                                    ->body(
+                                        $detected["marker"]
+                                            ? "Matched repository file: " . $detected["marker"] . ". Override it in Settings if needed."
+                                            : "No known project marker was found; review the type manually.",
+                                    )
+                                    ->success()
+                                    ->send();
+                            } catch (\Throwable $e) {
+                                \Filament\Notifications\Notification::make()
+                                    ->title("Detection failed")
+                                    ->body(
+                                        $e instanceof \RuntimeException ||
+                                        $e instanceof \InvalidArgumentException
+                                            ? $e->getMessage()
+                                            : "The GitHub API could not be queried.",
+                                    )
+                                    ->danger()
+                                    ->send();
+                            }
                         }),
                     A\Action::make("releaseLock")
                         ->label("Release stuck operation")
