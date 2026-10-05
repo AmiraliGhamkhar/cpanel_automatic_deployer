@@ -3,7 +3,7 @@ namespace Tests\Feature;
 use Tests\TestCase;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use App\Models\{Server, Project, User, Deployment};
-use App\Services\{CapabilityDetector, HealthCheckEngine};
+use App\Services\{CapabilityDetector, HealthCheckEngine, HealthCheckResult};
 use App\Services\Remote\{
     SshServiceInterface,
     CpanelServiceInterface,
@@ -28,6 +28,7 @@ class DeploymentSafetyTest extends TestCase
             "hostname" => "host.example.com",
             "cpanel_username" => "demo",
             "ssh_username" => "demo",
+            "cpanel_api_token" => "cpanel-api-secret-value",
             "connection_mode" => "ssh",
             "last_health_check_at" => now(),
             "capabilities" => array_fill_keys(
@@ -51,35 +52,94 @@ class DeploymentSafetyTest extends TestCase
         $p->update(["active_deployment_id" => $d->id]);
         return $d;
     }
-    private function remote(): void
+    private function remote(string $output = "SECRET-NEVER-LOG"): void
     {
         $ssh = Mockery::mock(SshServiceInterface::class);
         $ssh->shouldReceive("connect", "upload")->andReturnNull();
-        $ssh->shouldReceive("run")->andReturn("SECRET-NEVER-LOG");
+        $ssh->shouldReceive("run")->andReturn($output);
         $ssh->shouldReceive("exists")->andReturn(true);
         $this->app->instance(SshServiceInterface::class, $ssh);
         $git = Mockery::mock(GitHubService::class);
         $git->shouldReceive("commit")->andReturn(str_repeat("a", 40));
         $this->app->instance(GitHubService::class, $git);
     }
-    public function test_failed_health_check_never_reports_success_or_leaks_output(): void
+    public function test_failed_health_check_never_reports_success_and_records_diagnostics(): void
     {
         $d = $this->setupDeployment();
         $this->remote();
         $health = Mockery::mock(HealthCheckEngine::class);
-        $health->shouldReceive("check")->once()->andReturn(false);
+        $health->shouldReceive("check")->once()->andReturn(
+            HealthCheckResult::fail("HTTPS request returned HTTP 503.", "http"),
+        );
         $this->app->instance(HealthCheckEngine::class, $health);
+
         new DeployProjectJob($d->id)->handle(app(DeploymentService::class));
+
         $d->refresh();
         $this->assertSame("failed", $d->status);
         $this->assertNull($d->project->active_deployment_id);
-        $this->assertStringNotContainsString(
-            "SECRET-NEVER-LOG",
-            $d->log_output,
+        $this->assertSame("Verify configured health check", $d->failure_step);
+        $this->assertStringContainsString("HTTP 503", (string) $d->failure_detail);
+        $this->assertStringContainsString(
+            "Failed step: Verify configured health check.",
+            $d->failure_reason,
         );
         $this->assertStringContainsString(
-            "Verify HTTPS health check",
+            "Verify configured health check",
             $d->log_output,
+        );
+    }
+
+    public function test_remote_output_is_logged_but_stored_credentials_are_redacted(): void
+    {
+        $d = $this->setupDeployment();
+        $this->remote("composer install failed: cpanel-api-secret-value");
+
+        $health = Mockery::mock(HealthCheckEngine::class);
+        $health->shouldReceive("check")->andReturn(
+            HealthCheckResult::pass("HTTPS request returned HTTP 200."),
+        );
+        $this->app->instance(HealthCheckEngine::class, $health);
+
+        new DeployProjectJob($d->id)->handle(app(DeploymentService::class));
+
+        $d->refresh();
+        // Diagnostics survive, stored credentials do not.
+        $this->assertStringContainsString("composer install failed", (string) $d->log_output);
+        $this->assertStringNotContainsString("cpanel-api-secret-value", (string) $d->log_output);
+        $this->assertStringContainsString("[REDACTED]", (string) $d->log_output);
+    }
+
+    public function test_failed_remote_command_reports_step_and_output(): void
+    {
+        $d = $this->setupDeployment();
+        $ssh = Mockery::mock(SshServiceInterface::class);
+        $ssh->shouldReceive("connect", "upload")->andReturnNull();
+        $ssh->shouldReceive("exists")->andReturn(true);
+        $ssh->shouldReceive("run")->andThrow(
+            new \App\Services\Remote\RemoteCommandFailed(
+                "PHP extension xyz is missing",
+                1,
+                "Run composer",
+            ),
+        );
+        $this->app->instance(SshServiceInterface::class, $ssh);
+        $git = Mockery::mock(GitHubService::class);
+        $git->shouldReceive("commit")->andReturn(str_repeat("a", 40));
+        $this->app->instance(GitHubService::class, $git);
+
+        new DeployProjectJob($d->id)->handle(app(DeploymentService::class));
+
+        $d->refresh();
+        $this->assertSame("failed", $d->status);
+        $this->assertNotNull($d->failure_step);
+        $this->assertStringContainsString(
+            "PHP extension xyz is missing",
+            (string) $d->failure_detail,
+        );
+        $this->assertStringContainsString(
+            "status 1",
+            (string) $d->failure_detail,
         );
     }
     public function test_success_requires_health_and_records_release(): void
@@ -87,13 +147,17 @@ class DeploymentSafetyTest extends TestCase
         $d = $this->setupDeployment();
         $this->remote();
         $health = Mockery::mock(HealthCheckEngine::class);
-        $health->shouldReceive("check")->once()->andReturn(true);
+        $health->shouldReceive("check")->once()->andReturn(
+            HealthCheckResult::pass("HTTPS request returned HTTP 200."),
+        );
         $this->app->instance(HealthCheckEngine::class, $health);
         new DeployProjectJob($d->id)->handle(app(DeploymentService::class));
         $d->refresh();
         $this->assertSame("success", $d->status);
         $this->assertTrue($d->rollback_available);
         $this->assertSame($d->id, $d->project->current_deployment_id);
+        $this->assertSame("running", $d->project->status);
+        $this->assertNotNull($d->project->health_checked_at);
     }
     public function test_optional_capability_failures_are_not_fatal(): void
     {

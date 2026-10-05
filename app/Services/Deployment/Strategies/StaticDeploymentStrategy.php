@@ -1,19 +1,12 @@
 <?php
+
 namespace App\Services\Deployment\Strategies;
-use App\Models\Project;
-class StaticDeploymentStrategy implements DeploymentStrategy
+
+/** Static releases, optionally built with npm before activation. */
+class StaticDeploymentStrategy extends ConfigurableStrategy
 {
-    public function requirements(): array
+    protected function type(): string
     {
-        return ["git", "timeout"];
-    }
-    public function steps(Project $project, bool $hasRequirements = true): array
-    {
-        return $project->settings["build"] ?? false
-            ? [
-                "Install build dependencies" => "npm",
-                "Build static assets" => "build",
-            ]
-            : [];
+        return "static";
     }
 }

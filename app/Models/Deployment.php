@@ -28,6 +28,35 @@ class Deployment extends Model
     {
         return $this->belongsTo(User::class, "triggered_by");
     }
+    /**
+     * Parse the stored JSON-lines log into structured steps for the UI.
+     *
+     * The newest entry per step is kept so a retried step shows its latest
+     * status rather than the "running" placeholder.
+     *
+     * @return list<array{time:string,step:string,status:string,message:string,duration:float|null}>
+     */
+    public function steps(): array
+    {
+        $steps = [];
+        foreach (explode("\n", (string) $this->log_output) as $line) {
+            $decoded = json_decode(trim($line), true);
+            if (!is_array($decoded) || !isset($decoded["step"])) {
+                continue;
+            }
+            $steps[$decoded["step"]] = [
+                "time" => (string) ($decoded["time"] ?? ""),
+                "step" => (string) $decoded["step"],
+                "status" => (string) ($decoded["status"] ?? "unknown"),
+                "message" => (string) ($decoded["message"] ?? ""),
+                "duration" => isset($decoded["duration"]) && $decoded["status"] !== "running"
+                    ? (float) $decoded["duration"]
+                    : null,
+            ];
+        }
+        return array_values($steps);
+    }
+
     public function transition(string $next): void
     {
         $allowed = [

@@ -1,10 +1,15 @@
 name: Tests
-on: [push, pull_request]
+
+on: [push, pull_request, workflow_dispatch]
+
 permissions:
   contents: read
+
+# One job on purpose: hosted runners are scarce for this repository, and a
+# second parallel job starves until the 15-minute acquisition timeout kills it.
 jobs:
   php:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
@@ -15,7 +20,71 @@ jobs:
       - run: composer install --no-interaction --prefer-dist
       - run: composer validate --strict
       - run: php tests/security-smoke.php
-      - run: composer test -- --log-junit test-results.xml
-      - name: Report PHPUnit results
+      - name: Boot the application the way production does
+        run: |
+          cp .env.example .env
+          php artisan key:generate --force
+          mkdir -p database storage/framework/{cache/data,sessions,views} storage/logs
+          touch database/control.sqlite
+          php artisan migrate --force --database=sqlite
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+          php artisan route:list --path=admin | head -5
+          php artisan control:admin --help >/dev/null
+          php artisan control:reap --dry-run
+        env:
+          APP_ENV: production
+          APP_DEBUG: false
+          APP_URL: https://control.example.com
+          DB_CONNECTION: sqlite
+          DB_DATABASE: database/control.sqlite
+          SESSION_DRIVER: database
+          QUEUE_CONNECTION: database
+          CACHE_STORE: database
+          SESSION_SECURE_COOKIE: 'false'
+      - name: Suite hygiene (load-time fatal guards)
+        run: php tests/suite-hygiene.php
+      - name: Control-plane test suite
+        run: composer test -- --log-junit test-results.xml 2>&1 | tee phpunit-output.log
+      - name: Report control-plane results
         if: always()
-        run: php tests/report-ci.php test-results.xml
+        run: php tests/report-ci.php test-results.xml phpunit-output.log
+      - name: Start a real SSH server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends openssh-server >/dev/null
+          ssh-keygen -q -t ed25519 -f ~/.ssh/id_ed25519 -N '' -C ci
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo ssh-keygen -A
+          sudo mkdir -p /run/sshd
+          # Exactly one host key, so the pinned fingerprint is unambiguous.
+          sudo /usr/sbin/sshd -p 2222 \
+            -o HostKey=/etc/ssh/ssh_host_ed25519_key \
+            -o PasswordAuthentication=no \
+            -o PubkeyAuthentication=yes \
+            -o PermitRootLogin=no \
+            -o AuthorizedKeysFile=.ssh/authorized_keys \
+            -o StrictModes=no
+          HOST_KEY=/etc/ssh/ssh_host_ed25519_key.pub
+          echo "CONTROL_SSH_TEST_TARGET=127.0.0.1:2222" >> "$GITHUB_ENV"
+          echo "CONTROL_SSH_TEST_USER=$(id -un)" >> "$GITHUB_ENV"
+          echo "CONTROL_SSH_TEST_FINGERPRINT=$(ssh-keygen -lf "$HOST_KEY" -E sha256 | awk '{print $2}')" >> "$GITHUB_ENV"
+          {
+            echo 'CONTROL_SSH_TEST_KEY<<SSHKEY'
+            cat ~/.ssh/id_ed25519
+            echo 'SSHKEY'
+          } >> "$GITHUB_ENV"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 "$(id -un)@127.0.0.1" 'echo ssh-ready'
+      - name: Integration suite (real SSH, real clone, real rollback)
+        run: php vendor/bin/phpunit --testsuite Integration --log-junit integration-results.xml 2>&1 | tee phpunit-integration.log
+      - name: Report integration results
+        if: always()
+        run: |
+          if [ -f integration-results.xml ] || [ -f phpunit-integration.log ]; then
+            php tests/report-ci.php integration-results.xml phpunit-integration.log
+          else
+            echo "The integration suite did not run; nothing to report."
+          fi

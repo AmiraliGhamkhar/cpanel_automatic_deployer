@@ -22,14 +22,18 @@ The control plane and hosting targets are separate trust domains. Jobs serialize
 
 - `ConfigurationService`: validation, path isolation, write-only credentials and audit.
 - `DeploymentService`: preflight, transactionally queue, orchestrate structured steps and track actual activation.
-- `Strategies/*`: framework-specific allowlisted operations. Migrations are opt-in.
+- `StrategyRegistry` + `Deployment/Strategies/*`: framework-specific allowlisted operations, driven by `config/deployment_templates.php` (markers, steps, restart and health-check strategies). Project type detection walks the repository tree and reports which marker matched.
+- `CpanelGitDeploymentService`: UAPI-only transport for accounts without SSH.
 - `RollbackDeploymentService`: restrict target selection to verified, same-project releases.
+- `Backup/*`: release archives, SSH-only database dumps and explicit restore-as-deployment.
+- `Operations/StaleOperationReaper` + `control:reap`: release reservations abandoned by a dead worker.
 - `Remote/Command`: private constructor; only predefined builders can produce shell commands.
 - `Remote/SshService`: pinned key verification, bounded command output, SFTP operations.
 - `Remote/CpanelUapiService`: endpoint allowlist, safe failure categories, no raw payload to UI.
 - `ProjectOperations`: confirmed environment changes and maintenance exclusion.
-- `BackupManager`: interface; `FileBackupManager` archives release files only.
+- `FileBackupManager`: interface; release-file archives only.
 - `PublicHttp`: HTTPS, no redirects, DNS address validation/pinning, bounded responses/timeouts.
+- Filament resources/actions/widgets mirror the same rules in the UI: actions that cannot work for a transport are hidden rather than failing at runtime.
 
 ## Data / concurrency
 
@@ -49,4 +53,4 @@ A deployment job has one attempt. Queue middleware prevents duplicate simultaneo
 - Symlink and SFTP POSIX rename support is verified by actual operations, not inferred solely from binary presence.
 - Structured logs omit remote stdout rather than attempting to guarantee arbitrary-output redaction.
 - Database and environment rollback are separate operational concerns; a release rollback cannot guarantee schema compatibility.
-- No production verification claim until Composer/Filament tests and a live provider rehearsal pass.
+- No production verification claim until Composer/Filament tests and a live provider rehearsal pass. The PHPUnit suite (including the real-SSH integration suite) runs in GitHub Actions; loopback SSH and a real clone are still not a substitute for a live cPanel/Iranian-provider rehearsal.

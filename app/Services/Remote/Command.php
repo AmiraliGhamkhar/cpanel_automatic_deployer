@@ -3,7 +3,12 @@ namespace App\Services\Remote;
 use App\Services\Security\Input;
 final class Command
 {
-    private function __construct(public readonly string $shell) {}
+    public const DEFAULT_LABEL = "remote command";
+
+    private function __construct(
+        public readonly string $shell,
+        public readonly string $label = self::DEFAULT_LABEL,
+    ) {}
     private static function q(string $v): string
     {
         return escapeshellarg($v);
@@ -24,12 +29,187 @@ final class Command
             "tar" => "command -v tar",
             "symlink" => "command -v ln",
             "passenger" => "command -v passenger-config",
+            "mysqldump" => "command -v mysqldump",
         ];
         if (!isset($probes[$name])) {
             throw new \InvalidArgumentException("Unknown diagnostic");
         }
         return new self($probes[$name]);
     }
+    /**
+     * Look for a configured application process owned by the account.
+     *
+     * The pattern is validated as a literal and quoted; grep receives it as a
+     * fixed string. A missing process surfaces as a non-zero exit status.
+     */
+    public static function processCheck(string $pattern): self
+    {
+        Input::processPattern($pattern);
+        return new self(
+            'ps -u $(id -un) -o args= 2>/dev/null | grep -q -F -- ' .
+                self::q($pattern),
+            "Check application process",
+        );
+    }
+
+    /**
+     * Dump one database to a gzipped file using a temporary option file.
+     *
+     * The option file is removed even when the dump fails. Options that vary
+     * between MySQL/MariaDB versions are opt-in and whitelisted.
+     *
+     * @param list<string> $extraOptions
+     */
+    public static function databaseDump(
+        string $base,
+        int $backupId,
+        string $database,
+        string $optionFile,
+        array $extraOptions = [],
+    ): self {
+        \App\Services\Backup\DatabaseCredentials::database($database);
+        \App\Services\Security\Input::path($base);
+        if (
+            !preg_match(
+                "~\A/home/[A-Za-z][A-Za-z0-9_-]{0,31}/[A-Za-z0-9_/-]+/shared/\.mysql-[0-9]+\.cnf\z~D",
+                $optionFile,
+            )
+        ) {
+            throw new \InvalidArgumentException("Invalid option file path");
+        }
+        $allowed = [
+            "--no-tablespaces",
+            "--column-statistics=0",
+            "--set-gtid-purged=OFF",
+            "--skip-comments",
+            "--hex-blob",
+            "--routines",
+            "--triggers",
+            "--events",
+        ];
+        foreach ($extraOptions as $option) {
+            if (!in_array($option, $allowed, true)) {
+                throw new \InvalidArgumentException(
+                    "Unsupported mysqldump option",
+                );
+            }
+        }
+        $out = self::q($base . "/backups/database-" . $backupId . ".sql.gz");
+        $cnf = self::q($optionFile);
+        $extra = $extraOptions === [] ? "" : " " . implode(" ", $extraOptions);
+        // The option file path is restricted to [A-Za-z0-9_/.-] by the guard
+        // above, so it cannot escape the single quotes used by trap.
+        $script =
+            "umask 077; trap 'rm -f " .
+            $optionFile .
+            "' EXIT; test ! -L " .
+            $cnf .
+            " && mysqldump --defaults-extra-file=" .
+            $cnf .
+            " --single-transaction --quick --skip-lock-tables" .
+            $extra .
+            " " .
+            self::q($database) .
+            " | gzip -c > " .
+            $out .
+            " && test -s " .
+            $out;
+        return new self(
+            "cd " . self::q($base) . " && timeout 600 sh -c " . self::q($script),
+            "Dump database",
+        );
+    }
+
+    /** Import a gzipped dump into one database (explicit, confirmed restore). */
+    public static function databaseRestore(
+        string $base,
+        int $backupId,
+        string $database,
+        string $optionFile,
+    ): self {
+        \App\Services\Backup\DatabaseCredentials::database($database);
+        \App\Services\Security\Input::path($base);
+        $dump = self::q($base . "/backups/database-" . $backupId . ".sql.gz");
+        $cnf = self::q($optionFile);
+        $script =
+            "umask 077; trap 'rm -f " .
+            $optionFile .
+            "' EXIT; test ! -L " .
+            $cnf .
+            " && test -s " .
+            $dump .
+            " && gunzip -c " .
+            $dump .
+            " | mysql --defaults-extra-file=" .
+            $cnf .
+            " " .
+            self::q($database);
+        return new self(
+            "cd " . self::q($base) . " && timeout 600 sh -c " . self::q($script),
+            "Restore database",
+        );
+    }
+
+    /** Extract a file backup archive into a fresh, empty release directory. */
+    public static function restoreArchive(
+        string $base,
+        string $release,
+        int $backupId,
+    ): self {
+        \App\Services\Security\Input::path($base);
+        $archive = self::q($base . "/backups/" . $backupId . ".tar.gz");
+        $relative = substr($release, strlen($base) + 1);
+        if (!preg_match("~\Areleases/[0-9]+\z~D", $relative)) {
+            throw new \InvalidArgumentException("Invalid release path");
+        }
+        $target = self::q($release);
+        return new self(
+            "test ! -L " .
+                $archive .
+                " && test -f " .
+                $archive .
+                " && test ! -e " .
+                $target .
+                " && test ! -L " .
+                $target .
+                " && mkdir -p -- " .
+                $target .
+                " && umask 077 && timeout 300 tar -xzf " .
+                $archive .
+                " -C " .
+                $target .
+                " && test -n \"$(ls -A -- " .
+                $target .
+                ")\"",
+            "Extract backup archive",
+        );
+    }
+
+    /** Delete one managed archive. Only files this panel created are addressed. */
+    public static function deleteArchive(
+        string $base,
+        int $backupId,
+        string $type = "files",
+    ): self {
+        \App\Services\Security\Input::path($base);
+        $name = in_array($type, ["files", "database"], true)
+            ? "backups/" . $backupId . ".tar.gz"
+            : null;
+        if ($type === "database") {
+            $name = "backups/database-" . $backupId . ".sql.gz";
+        }
+        if ($name === null) {
+            throw new \InvalidArgumentException("Invalid archive type");
+        }
+        return new self(
+            "test ! -L " .
+                self::q($base . "/" . $name) .
+                " && rm -f -- " .
+                self::q($base . "/" . $name),
+            "Delete archive",
+        );
+    }
+
     public static function initialize(
         string $base,
         int $id,
@@ -49,6 +229,7 @@ final class Command
         return new self(
             implode(" && ", $checks) .
                 " && mkdir -p -- $q && test \"$(cd $q && pwd -P)\" = $q && (test -f $marker || (test -z \"$(ls -A -- $q)\" && touch -- $marker))",
+            "Initialize project directory",
         );
     }
     public static function prepare(string $base, int $id): self
@@ -61,6 +242,7 @@ final class Command
             "test -f " .
                 self::q($base . "/.control-project-" . $id) .
                 " && test ! -L $r && test ! -L $s && test ! -L $b && mkdir -p -- $r $s $b && chmod 700 -- $s $b",
+            "Prepare release directories",
         );
     }
     public static function clone(
@@ -88,6 +270,7 @@ final class Command
                 self::q("origin/" . $branch) .
                 " && git checkout --detach " .
                 self::q($sha),
+            "Clone repository",
         );
     }
     public static function install(string $release, string $operation): self
@@ -117,6 +300,7 @@ final class Command
                 self::q($release) .
                 " && timeout 300 sh -c " .
                 self::q($ops[$operation]),
+            "Run " . $operation,
         );
     }
     public static function linkEnvironment(string $base, string $release): self
@@ -130,6 +314,7 @@ final class Command
                 self::q($base . "/shared/.env") .
                 " " .
                 self::q($release . "/.env"),
+            "Link environment file",
         );
     }
     public static function removeGitMetadata(string $release): self
@@ -150,6 +335,7 @@ final class Command
                 self::q($release . "/.git") .
                 " && rm -rf -- " .
                 self::q($release . "/.git"),
+            "Remove Git metadata",
         );
     }
     public static function storage(string $base, string $release): self
@@ -182,8 +368,67 @@ final class Command
                 $storage .
                 " " .
                 $target,
+            "Link persistent storage",
         );
     }
+    /**
+     * At least one of the given repository files must exist in the tree.
+     *
+     * Used before a release goes live so an empty or wrong checkout is caught
+     * while the previous release is still serving.
+     */
+    public static function verifyRelease(string $path, array $files): self
+    {
+        Input::path($path);
+        if ($files === []) {
+            throw new \InvalidArgumentException("Nothing to verify");
+        }
+        $checks = [];
+        foreach ($files as $file) {
+            $checks[] = "test -f " . self::q($path . "/" . Input::filename($file));
+        }
+        return new self(
+            "( " . implode(" || ", $checks) . " )",
+            "Verify deployed files",
+        );
+    }
+
+    /**
+     * In-place activation for hosts where a symlinked document root is not
+     * reliable.
+     *
+     * The live directory is archived first and the archive must succeed before
+     * anything is deleted. The release is then copied over the real directory,
+     * so rollback can copy an older release back in the same way.
+     */
+    public static function inPlaceActivate(
+        string $base,
+        string $release,
+        int $projectId,
+        int $deploymentId,
+    ): self {
+        Input::path($base);
+        $relative = substr($release, strlen($base) + 1);
+        if (!preg_match("~\\Areleases/[0-9]+\\z~D", $relative)) {
+            throw new \InvalidArgumentException("Invalid release path");
+        }
+        $source = self::q($release);
+        $app = self::q($base . "/app");
+        $marker = self::q($base . "/.control-project-" . $projectId);
+        $backups = self::q($base . "/backups");
+        $archive = self::q($base . "/backups/inplace-" . $deploymentId . ".tar.gz");
+        return new self(
+            "test -d $source && test ! -L $source && test -f $marker" .
+                " && test ! -L $app && test -d $backups && test ! -L $backups" .
+                " && ( test ! -d $app || test -z \"$(ls -A -- $app)\" || ( test ! -e $archive && umask 077 && timeout 300 tar --exclude=.env -czf $archive -C $app . ) )" .
+                " && mkdir -p -- $app && test ! -L $app" .
+                " && find $app -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +" .
+                " && cp -a -- $source/. $app/" .
+                " && test -n \"$(ls -A -- $app)\"",
+            "Activate in-place release",
+        );
+    }
+
     public static function activate(
         string $base,
         string $release,
@@ -205,6 +450,7 @@ final class Command
                 " && test ! -e .current-next && test ! -L .current-next && ln -s -- " .
                 self::q($relative) .
                 " .current-next && mv -Tf -- .current-next current",
+            "Activate release",
         );
     }
     public static function archive(
@@ -220,6 +466,7 @@ final class Command
                 " -C " .
                 self::q($release) .
                 " .",
+            "Create release archive",
         );
     }
 }

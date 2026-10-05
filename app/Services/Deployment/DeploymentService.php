@@ -31,6 +31,11 @@ class DeploymentService
         Input::branch($branch);
         if ($sha) {
             Input::commit($sha);
+            if ($project->deployment_mode !== "ssh") {
+                throw new RuntimeException(
+                    "cPanel Git deployments always take the latest commit on the branch; deploy a pinned commit with SSH releases.",
+                );
+            }
         }
         return $this->queue($project, $user, "deploy", $branch, $sha, null);
     }
@@ -40,12 +45,20 @@ class DeploymentService
         string $kind,
         string $branch,
         ?string $sha,
-        ?Deployment $target,
+        ?Deployment $target = null,
+        ?int $sourceBackupId = null,
     ): Deployment {
         Gate::forUser($user)->authorize("deploy", $project);
-        if (!in_array($kind, ["deploy", "rollback"], true)) {
+        if (!in_array($kind, ["deploy", "rollback", "restore"], true)) {
             throw new RuntimeException("Invalid operation.");
         }
+        if ($kind === "restore" && !$sourceBackupId) {
+            throw new RuntimeException(
+                "A file restore requires the backup it restores.",
+            );
+        }
+        // Release an operation abandoned by a dead worker before reporting busy.
+        app(\App\Services\Operations\StaleOperationReaper::class)->reap($project);
         return DB::transaction(function () use (
             $project,
             $user,
@@ -53,6 +66,7 @@ class DeploymentService
             $branch,
             $sha,
             $target,
+            $sourceBackupId,
         ) {
             \App\Models\Server::lockForUpdate()->findOrFail(
                 $project->server_id,
@@ -70,10 +84,11 @@ class DeploymentService
                 "commit_hash" => $sha,
                 "kind" => $kind,
                 "target_deployment_id" => $target?->id,
+                "source_backup_id" => $sourceBackupId,
             ]);
             $p->update(["active_deployment_id" => $d->id]);
             Audit::record(
-                strtoupper($kind) . "_PROJECT",
+                self::auditAction($kind),
                 "queued",
                 $p->id,
                 $p->server_id,
@@ -91,17 +106,10 @@ class DeploymentService
         }
         Input::repository($p->repository_url);
         Input::branch($p->branch);
-        Input::path($p->remote_path, $s->ssh_username);
-        if ($p->deployment_mode !== "ssh") {
-            throw new RuntimeException(
-                "This host mode is inspection-only; SSH deployment is required.",
-            );
-        }
-        if ($p->release_strategy !== "symlink") {
-            throw new RuntimeException(
-                "In-place deployment is not implemented safely. Use a provider-supported symlink document root.",
-            );
-        }
+        Input::path(
+            $p->remote_path,
+            $s->ssh_username ?? $s->cpanel_username,
+        );
         if ($p->project_type === "static" && !empty($p->environment_config)) {
             throw new RuntimeException(
                 "Static projects must not publish managed secrets. Remove environment values before deploying.",
@@ -120,8 +128,53 @@ class DeploymentService
                 "Run Test Connection first; capability results must be less than 24 hours old.",
             );
         }
+
+        // cPanel Git Version Control: no SSH, no release directory, provider
+        // owns the checkout and the file layout.
+        if ($p->deployment_mode === "cpanel_git") {
+            if (
+                !in_array(
+                    $s->connection_mode,
+                    ["cpanel_api", "cpanel_api_and_ssh"],
+                    true,
+                ) ||
+                !$s->cpanel_api_token
+            ) {
+                throw new RuntimeException(
+                    "cPanel Git mode requires a cPanel API token for this server.",
+                );
+            }
+            if (
+                ($s->capabilities["cpanel_git"]["status"] ?? "") !==
+                "available"
+            ) {
+                throw new RuntimeException(
+                    "Unsupported on this host: the cPanel Git Version Control API did not respond. Run Test Connection and review the provider's UAPI permissions.",
+                );
+            }
+            return;
+        }
+
+        if ($p->deployment_mode !== "ssh") {
+            throw new RuntimeException(
+                "Unsupported deployment mode. Use SSH or cPanel Git Version Control.",
+            );
+        }
+        if (!in_array($p->release_strategy, ["symlink", "in_place"], true)) {
+            throw new RuntimeException(
+                "Unknown release strategy. Use symlink releases or an in-place copy.",
+            );
+        }
+        if ($p->release_strategy === "in_place" && $p->public_path !== null) {
+            throw new RuntimeException(
+                "In-place releases serve the deployment directory directly; a public subdirectory hint is not supported. Remove the public path or use symlink releases.",
+            );
+        }
         $required = array_merge(
-            ["ssh", "sftp", "symlink"],
+            ["ssh", "sftp"],
+            $p->release_strategy === "symlink"
+                ? ["symlink"]
+                : ["tar", "timeout"],
             $this->strategies->for($p->project_type)->requirements(),
         );
         if ($p->settings["build"] ?? false) {
@@ -173,6 +226,11 @@ class DeploymentService
             "Validate configuration",
             fn() => $this->validate($p),
         );
+        if ($p->deployment_mode === "cpanel_git") {
+            // cPanel owns the checkout; the panel only orchestrates and verifies.
+            app(CpanelGitDeploymentService::class)->execute($d);
+            return;
+        }
         $this->log->step(
             $d,
             "Connect with pinned SSH host key",
@@ -218,6 +276,46 @@ class DeploymentService
                 "commit_hash" => $target->commit_hash,
                 "release_path" => $release,
             ]);
+        } elseif ($d->kind === "restore") {
+            $release = $base . "/releases/" . $d->id;
+            $d->update(["release_path" => $release]);
+            $backup = \App\Models\Backup::find((int) $d->source_backup_id);
+            if (
+                !$backup ||
+                $backup->project_id !== $p->id ||
+                $backup->type !== "files" ||
+                $backup->status !== "success"
+            ) {
+                throw new RuntimeException(
+                    "The selected backup is no longer available for restore.",
+                );
+            }
+            $this->log->step(
+                $d,
+                "Extract backup archive",
+                fn() => $this->ssh->run(
+                    Command::restoreArchive($base, $release, $backup->id),
+                ),
+            );
+            if ($p->project_type !== "static") {
+                $this->log->step(
+                    $d,
+                    "Restore protected environment",
+                    function () use ($p, $base, $release) {
+                        $this->writeEnvironment($p);
+                        $this->ssh->run(
+                            Command::linkEnvironment($base, $release),
+                        );
+                    },
+                );
+            }
+            if ($p->project_type === "laravel") {
+                $this->log->step(
+                    $d,
+                    "Link persistent Laravel storage",
+                    fn() => $this->ssh->run(Command::storage($base, $release)),
+                );
+            }
         } else {
             $sha = $this->log->step(
                 $d,
@@ -282,11 +380,38 @@ class DeploymentService
                 );
             }
         }
+        $candidates = $this->strategies
+            ->for($p->project_type)
+            ->verificationCandidates();
+        if ($candidates !== []) {
+            // Verified while the previous release is still serving.
+            $this->log->step(
+                $d,
+                "Verify release contents",
+                fn() => $this->ssh->run(Command::verifyRelease($release, $candidates)),
+            );
+        }
+
+        $inPlace = $p->release_strategy === "in_place";
         $this->log->step(
             $d,
-            "Activate release",
-            fn() => $this->ssh->run(Command::activate($base, $release, $p->id)),
+            $inPlace ? "Activate in-place release" : "Activate release",
+            fn() => $this->ssh->run(
+                $inPlace
+                    ? Command::inPlaceActivate($base, $release, $p->id, $d->id)
+                    : Command::activate($base, $release, $p->id),
+            ),
         );
+        if ($inPlace && $candidates !== []) {
+            // The live directory is what the provider serves: verify the copy.
+            $this->log->step(
+                $d,
+                "Verify deployed files",
+                fn() => $this->ssh->run(
+                    Command::verifyRelease($p->livePath(), $candidates),
+                ),
+            );
+        }
         // Track the actual filesystem switch even when the subsequent health check fails.
         $p->update(["current_deployment_id" => $d->id]);
         $this->log->step(
@@ -294,9 +419,19 @@ class DeploymentService
             "Apply restart strategy",
             fn() => $this->restart($p),
         );
-        $this->log->step($d, "Verify HTTPS health check", function () use ($p) {
-            if (!$this->health->check($p->health_check_url)) {
-                throw new RuntimeException("Health check failed.");
+        $this->log->step($d, "Verify configured health check", function () use (
+            $p,
+        ) {
+            $result = $this->health->check($p, $this->ssh);
+            // Record the probe on the project so the UI never shows a stale verdict.
+            Project::whereKey($p->id)->update([
+                "health_checked_at" => now(),
+                "health_check_message" => mb_substr($result->message, 0, 500),
+            ]);
+            if (!$result->passed) {
+                throw new RuntimeException(
+                    "Health check failed: " . $result->message,
+                );
             }
         });
         DB::transaction(function () use ($d, $p) {
@@ -308,7 +443,7 @@ class DeploymentService
             ]);
             $p->update(["active_deployment_id" => null, "status" => "running"]);
             Audit::record(
-                strtoupper($d->kind) . "_PROJECT",
+                self::auditAction($d->kind),
                 "success",
                 $p->id,
                 $p->server_id,
@@ -316,6 +451,29 @@ class DeploymentService
             );
         });
     }
+    /** Audit action for an operation kind, so history reads consistently. */
+    public static function auditAction(string $kind): string
+    {
+        return match ($kind) {
+            "rollback" => "ROLLBACK_PROJECT",
+            "restore" => "RESTORE_BACKUP",
+            default => "DEPLOY_PROJECT",
+        };
+    }
+
+    /** Short, first-party failure summary for lists; detail lives in failure_detail. */
+    public function failureSummary(Deployment $d): string
+    {
+        if ($d->failure_step) {
+            return mb_substr(
+                "Failed step: " . $d->failure_step . ".",
+                0,
+                250,
+            );
+        }
+        return "Deployment failed before a step reported a reason. Inspect the log, provider limits and the queue worker.";
+    }
+
     public function writeEnvironment(Project $p): void
     {
         $this->ssh->upload(
@@ -326,9 +484,7 @@ class DeploymentService
     public function restart(Project $p): void
     {
         if (($p->settings["restart"] ?? "none") === "passenger") {
-            $this->ssh->run(
-                Command::install($p->remote_path . "/current", "passenger"),
-            );
+            $this->ssh->run(Command::install($p->livePath(), "passenger"));
         }
     }
     public function fail(int $id): void
@@ -344,8 +500,9 @@ class DeploymentService
                 "duration" => $d->started_at
                     ? (int) $d->started_at->diffInSeconds(now())
                     : 0,
-                "failure_reason" =>
-                    "Deployment failed. See the last failed step; verify provider limits, runtime and health endpoint.",
+                "failure_reason" => $this->failureSummary($d),
+                // A release was switched but is not healthy: offer the way back.
+                "rollback_available" => $d->previous_release_path !== null,
             ]);
             Project::whereKey($d->project_id)
                 ->where("active_deployment_id", $id)
@@ -354,7 +511,7 @@ class DeploymentService
                     "status" => "failed",
                 ]);
             Audit::record(
-                strtoupper($d->kind) . "_PROJECT",
+                self::auditAction($d->kind),
                 "failed",
                 $d->project_id,
                 null,

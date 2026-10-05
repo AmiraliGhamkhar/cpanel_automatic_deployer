@@ -1,18 +1,12 @@
 <?php
+
 namespace App\Services\Deployment\Strategies;
-use App\Models\Project;
-class NodeDeploymentStrategy implements DeploymentStrategy
+
+/** npm ci and an optional build step for hosts that provide Node.js. */
+class NodeDeploymentStrategy extends ConfigurableStrategy
 {
-    public function requirements(): array
+    protected function type(): string
     {
-        return ["git", "node", "npm", "timeout"];
-    }
-    public function steps(Project $project, bool $hasRequirements = true): array
-    {
-        $steps = ["Install locked Node dependencies" => "npm"];
-        if ($project->settings["build"] ?? false) {
-            $steps["Build Node assets"] = "build";
-        }
-        return $steps;
+        return "node";
     }
 }

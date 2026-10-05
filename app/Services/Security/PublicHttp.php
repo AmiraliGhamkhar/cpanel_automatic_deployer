@@ -30,6 +30,10 @@ class PublicHttp
                 ) ||
                 str_starts_with($ip, "::ffff:")
             ) {
+                // Only the automated integration suite may opt out of this.
+                if (config("control.allow_private_targets") === true) {
+                    continue;
+                }
                 throw new RuntimeException(
                     "Private or reserved network destinations are not permitted.",
                 );

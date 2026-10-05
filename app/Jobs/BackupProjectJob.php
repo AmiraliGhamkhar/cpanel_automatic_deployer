@@ -3,7 +3,7 @@ namespace App\Jobs;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use App\Models\{Project, User, Backup};
-use App\Services\{BackupManager, Audit};
+use App\Services\Audit;
 use App\Services\Remote\{SshServiceInterface, Command};
 use Illuminate\Support\Facades\{Gate, DB};
 class BackupProjectJob implements ShouldQueue
@@ -28,7 +28,7 @@ class BackupProjectJob implements ShouldQueue
         ];
     }
     public function handle(
-        BackupManager $manager,
+        \App\Services\Backup\BackupTypeRegistry $registry,
         SshServiceInterface $ssh,
     ): void {
         $b = Backup::findOrFail($this->backupId);
@@ -56,7 +56,7 @@ class BackupProjectJob implements ShouldQueue
                 ),
             );
             $ssh->run(Command::prepare($p->remote_path, $p->id));
-            $manager->create($p, $b, $ssh);
+            $registry->for($b->type)->create($p, $b, $ssh);
             Audit::record(
                 "BACKUP_PROJECT",
                 "success",

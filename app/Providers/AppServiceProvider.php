@@ -12,11 +12,8 @@ class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->app->bind(
-            \App\Services\BackupManager::class,
-            \App\Services\FileBackupManager::class,
-        );
         $this->app->bind(SshServiceInterface::class, SshService::class);
+        $this->app->singleton(\App\Services\Backup\BackupTypeRegistry::class);
         $this->app->bind(
             CpanelServiceInterface::class,
             CpanelUapiService::class,

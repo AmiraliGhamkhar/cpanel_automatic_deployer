@@ -1,12 +1,20 @@
 <?php
+
 namespace App\Services\Deployment\Strategies;
+
 use App\Models\Project;
-class CustomDeploymentStrategy implements DeploymentStrategy
+
+/**
+ * Custom projects are intentionally not deployable from the UI: a deployment
+ * needs reviewed, first-party commands rather than operator-supplied shell.
+ */
+class CustomDeploymentStrategy extends ConfigurableStrategy
 {
-    public function requirements(): array
+    protected function type(): string
     {
-        return [];
+        return "custom";
     }
+
     public function steps(Project $project, bool $hasRequirements = true): array
     {
         throw new \RuntimeException(
