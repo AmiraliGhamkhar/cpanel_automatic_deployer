@@ -5,7 +5,12 @@ declare(strict_types=1);
 /**
  * Turn a PHPUnit JUnit report (plus the raw console log) into GitHub
  * annotations, because job logs are not always retrievable from the
- * development environment. Prints a human-readable summary as well.
+ * development environment.
+ *
+ * Annotations are the fallback channel, so the report deliberately covers the
+ * cases that matter for a process-level death: every fatal/PHP-level error line
+ * found anywhere in the log, plus the head and tail of the log when no usable
+ * JUnit report exists.
  *
  * Usage: php tests/report-ci.php [test-results.xml] [phpunit-output.log]
  */
@@ -14,7 +19,7 @@ $junit = $argv[1] ?? "test-results.xml";
 $logPath = $argv[2] ?? null;
 
 /** Escape a message for a GitHub workflow command. */
-function gh(string $message, int $limit = 1500): string
+function gh(string $message, int $limit = 1200): string
 {
     $message = str_replace("%", "%25", $message);
     $message = str_replace(["\r\n", "\r", "\n"], "%0A", $message);
@@ -22,41 +27,52 @@ function gh(string $message, int $limit = 1500): string
     return strlen($message) > $limit ? substr($message, 0, $limit) . "…" : $message;
 }
 
-/** @return array{0:int,1:int,2:int} tests, failures+errors, skipped */
-function report(string $junit): array
+function emit(string $level, string $message, string $file = "", int $line = 0): void
+{
+    if ($file !== "") {
+        fwrite(STDOUT, "::{$level} file={$file},line={$line}::" . gh($message) . "\n");
+        return;
+    }
+    fwrite(STDOUT, "::{$level}::" . gh($message) . "\n");
+}
+
+/**
+ * @return array{tests:int,bad:int,skipped:int,readable:bool}
+ */
+function readJunit(string $junit): array
 {
     if (!is_file($junit)) {
-        // Not a workflow command on purpose; the caller adds context.
-        return [0, 0, 0];
+        return ["tests" => 0, "bad" => 0, "skipped" => 0, "readable" => false];
     }
 
-    $xml = @simplexml_load_file($junit);
+    // A fatal error mid-run leaves the stream created by PHPUnit's JUnit
+    // logger empty; that is exactly the signal we must not swallow.
+    $raw = (string) @file_get_contents($junit);
+    if (trim($raw) === "" || stripos($raw, "<testsuites") === false) {
+        return ["tests" => 0, "bad" => 0, "skipped" => 0, "readable" => false];
+    }
+
+    $xml = @simplexml_load_string($raw);
     if ($xml === false) {
-        return [0, 0, 0];
+        return ["tests" => 0, "bad" => 0, "skipped" => 0, "readable" => false];
     }
-
-    $total = 0;
-    $bad = 0;
-    $skipped = 0;
-    $annotations = 0;
 
     $suites = [];
-    if (isset($xml->testsuite)) {
-        foreach ($xml->testsuite as $suite) {
-            $suites[] = $suite;
+    foreach ($xml->testsuite ?? [] as $suite) {
+        $suites[] = $suite;
+        foreach ($suite->testsuite ?? [] as $nested) {
+            $suites[] = $nested;
         }
     }
-    $nested = [];
+
+    $tests = 0;
+    $bad = 0;
+    $skipped = 0;
+    $annotated = 0;
+
     foreach ($suites as $suite) {
-        if (isset($suite->testsuite)) {
-            foreach ($suite->testsuite as $child) {
-                $nested[] = $child;
-            }
-        }
-    }
-    foreach (array_merge($suites, $nested) as $suite) {
-        foreach ($suite->testcase as $case) {
-            $total++;
+        foreach ($suite->testcase ?? [] as $case) {
+            $tests++;
             $class = (string) ($case["class"] ?? ($suite["name"] ?? "unknown"));
             $name = (string) ($case["name"] ?? "unnamed");
             $file = (string) ($case["file"] ?? "");
@@ -71,13 +87,9 @@ function report(string $junit): array
                 if (isset($case->$kind["message"])) {
                     $detail = trim((string) $case->$kind["message"]) . "\n" . $detail;
                 }
-                $message = $class . "::" . $name . " [" . $kind . "] " . $detail;
-                if ($annotations < 40) {
-                    $annotations++;
-                    fwrite(
-                        STDOUT,
-                        "::error file=" . $file . ",line=" . $line . "::" . gh($message) . "\n",
-                    );
+                if ($annotated < 40) {
+                    $annotated++;
+                    emit("error", "{$class}::{$name} [{$kind}] {$detail}", $file, $line);
                 }
             }
 
@@ -87,34 +99,83 @@ function report(string $junit): array
         }
     }
 
-    $summary = "PHPUnit: " . ($total - $bad - $skipped) . " passed, " . $bad . " failed, " . $skipped . " skipped, " . $total . " total";
-    fwrite(STDOUT, $summary . "\n");
-    if (getenv("GITHUB_ACTIONS") === "true") {
-        fwrite(STDOUT, "::notice::" . gh($summary) . "\n");
-    }
-
-    return [$total, $bad, $skipped];
+    return ["tests" => $tests, "bad" => $bad, "skipped" => $skipped, "readable" => true];
 }
 
-[$total, $bad] = report($junit);
+/**
+ * Annotate process-level failures (fatals, uncaught throwables, OOM, signals)
+ * wherever they appear in the log.
+ */
+function annotateFatalLines(string $logPath): int
+{
+    if (!is_file($logPath)) {
+        return 0;
+    }
 
-if ($total === 0 && $logPath !== null && is_file($logPath)) {
-    fwrite(STDOUT, "::error::PHPUnit produced no JUnit report; see the log tail below.\n");
-    $lines = @file($logPath, FILE_IGNORE_NEW_LINES) ?: [];
-    $tail = array_slice($lines, -30);
+    $pattern = "/Fatal error|Uncaught (Error|Exception|Throwable)|Allowed memory size|Stack overflow|Segmentation fault|Killed|Core dumped|PHP Warning:  Failed|not found in|Cannot declare|must be compatible|sh: line|bash: line/i";
+    $found = 0;
+    $seen = [];
+    foreach ((array) @file($logPath, FILE_IGNORE_NEW_LINES) as $line) {
+        if ($line === "" || !preg_match($pattern, $line)) {
+            continue;
+        }
+        $key = substr($line, 0, 200);
+        if (isset($seen[$key])) {
+            continue;
+        }
+        $seen[$key] = true;
+        $found++;
+        if ($found > 20) {
+            break;
+        }
+        emit("error", $line);
+    }
+
+    return $found;
+}
+
+function annotateChunk(string $label, array $lines): void
+{
     $chunk = "";
-    foreach ($tail as $line) {
+    foreach ($lines as $line) {
         $candidate = $chunk === "" ? $line : $chunk . "\n" . $line;
-        if (strlen($candidate) > 1200) {
-            fwrite(STDOUT, "::error::" . gh($chunk) . "\n");
+        if (strlen($candidate) > 1000) {
+            emit("error", "{$label}\n{$chunk}");
             $chunk = $line;
             continue;
         }
         $chunk = $candidate;
     }
     if ($chunk !== "") {
-        fwrite(STDOUT, "::error::" . gh($chunk) . "\n");
+        emit("error", "{$label}\n{$chunk}");
     }
 }
 
-exit($bad > 0 || ($total === 0 && $logPath !== null) ? 1 : 0);
+$result = readJunit($junit);
+$fatalLines = annotateFatalLines((string) $logPath);
+
+if ($result["readable"]) {
+    $summary = "PHPUnit: " . ($result["tests"] - $result["bad"] - $result["skipped"]) . " passed, " . $result["bad"] . " failed, " . $result["skipped"] . " skipped, " . $result["tests"] . " total";
+    fwrite(STDOUT, $summary . "\n");
+    if (getenv("GITHUB_ACTIONS") === "true") {
+        emit("notice", $summary);
+    }
+} else {
+    $summary = "PHPUnit produced no usable JUnit report (missing, empty or truncated): the process most likely died. " . $fatalLines . " fatal line(s) annotated.";
+    fwrite(STDOUT, $summary . "\n");
+    if (getenv("GITHUB_ACTIONS") === "true") {
+        emit("error", $summary);
+    }
+
+    if ($logPath !== null && is_file($logPath)) {
+        $lines = (array) @file($logPath, FILE_IGNORE_NEW_LINES);
+        annotateChunk("phpunit log head", array_slice($lines, 0, 12));
+        annotateChunk("phpunit log tail", array_slice($lines, -25));
+    }
+}
+
+if (!$result["readable"] && $logPath !== null) {
+    exit(1);
+}
+
+exit($result["bad"] > 0 ? 1 : 0);

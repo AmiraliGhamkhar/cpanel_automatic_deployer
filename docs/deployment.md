@@ -48,8 +48,47 @@ The remote application necessarily has access to plaintext secrets in a mode-060
 
 Choose a different verified success/rollback release from the same project's history. The worker verifies that the directory exists, switches `current`, restarts if configured, and runs the same health check. A new `rolled_back` record preserves the original history and selected commit. Database migrations are never reversed automatically. Before enabling migrations, use backward-compatible schema changes or a separately reviewed restore plan.
 
+## cPanel Git mode (`cpanel_git`)
+
+This transport does not use SSH. It drives the account's own **Git Version Control** feature through the cPanel UAPI token already stored on the server record, so it works on hosts that allow the cPanel API but not SSH keys.
+
+Prerequisites, configured in cPanel before the first deployment:
+
+1. Clone the repository into the account through cPanel → Git Version Control (or let the deploy action do it when the repository is already registered). The repository directory is what `remote_path` must point at: it is the deployment root for this mode, not a releases directory.
+2. Add a `.cpanel.yml` at the repository root containing the tasks to run after the pull. Without it the pull succeeds and **no** application step runs.
+3. Make the working tree clean. cPanel silently skips `.cpanel.yml` tasks when the repository directory has untracked files; the deployment then "succeeds" without rebuilding anything.
+
+Pipeline: `VersionControl/update` (pull the tracked branch) → `VersionControlDeployment/create` (run `.cpanel.yml` for the recorded HEAD) → the project's HTTPS health check.
+
+Deliberate limits of this mode:
+
+- **No releases and no rollback.** Files are pulled into one directory, so the panel hides the rollback, environment, restart and backup actions for these projects; the deployment record has no release path and reports `rollback_available = false`.
+- **No commit pinning.** The branch tip is deployed. Pinned commits, tags and historical deployments are refused with an explicit message instead of silently deploying something else.
+- **No environment-file management.** Use the cPanel UI (or the repository's own tooling) for `.env` content; the panel never writes into a `cpanel_git` directory.
+- **Asynchronous tasks, synchronous verification.** cPanel runs `.cpanel.yml` tasks in the background and returns only a `deploy_id`/task id. The panel therefore treats the health check as the acceptance signal and records the task id in the log; a failing task may only become visible as a failed health check.
+- **No panel-managed backups or restarts.** Passenger restarts and database dumps remain SSH-only features.
+
+Because the deploy step runs only `.cpanel.yml`, review that file with the same care as a deploy script: it runs with the account's privileges in the account's home directory.
+
 ## Backups
 
-Backup acquires the same project exclusion as deployment and requires a verified active release plus tar. It archives release files on the target, excluding .git and .env. It is **not** a complete application backup: databases, shared storage/uploads and external files are excluded. Cached application configuration or other release files may still contain secrets; archives remain private and must be handled as sensitive.
+Every backup acquires the same project exclusion as a deployment, so a backup and a deploy cannot overlap. Two kinds exist:
 
-Automatic restore/delete/download, database backups and off-site copies are not implemented. Use your provider's tested backup tooling for disaster recovery. A same-host archive does not protect against loss of that host. Restore manually into an isolated staging location after validating the archive and compatibility; do not overwrite a live directory from an unverified archive.
+- **Release archive** (`backups/<backup-id>.tar.gz`): the files of the verified active release, excluding `.git` and `.env`. It is **not** a complete application backup — shared storage/uploads and external files are excluded, and cached framework configuration inside a release can still contain secrets. Treat archives as sensitive.
+- **Database dump** (`backups/database-<backup-id>.sql.gz` or the configured client's extension): produced over SSH, using the credentials the application already has. `db_dump_options` is a whitelist of extra client flags; arbitrary flags are rejected. Credentials are read from the target's shared `.env` (`DatabaseCredentials::fromEnvironment()`), written to a `0600` option file under `shared/`, passed to the client, and removed afterwards. The dump never passes through control-plane storage.
+
+Restores are explicit and are recorded as their own `restore` deployment: choose the database backup to restore, confirm, and the worker streams the dump back into the database named by the current credentials. A restore does **not** touch releases, and a release rollback does not touch data. Because a restore is destructive, run it only against a target you are willing to overwrite and take a fresh dump first.
+
+Backup deletion removes the archive/dump on the target and the record; it is audited. Off-site copies, downloads to the control plane, scheduled backup rotation and point-in-time recovery are **not** implemented: use the provider's tooling for disaster recovery. A same-host archive does not protect against loss of that host.
+
+Database backups are SSH-only on purpose. The UAPI DB-dump/backup function names for third-party providers are unverified, so `cpanel_git` projects do not expose database backups.
+
+## Stale operations
+
+A worker killed with SIGKILL, a disconnected queue or a host outage can leave a project reservation behind. `control:reap` releases operations that have produced no terminal state for `control.stale_operation_after` seconds (default 2700, floor 600).
+
+```cron
+*/5 * * * * cd /path/to/app && php artisan control:reap >> storage/logs/reap.log 2>&1
+```
+
+`--dry-run` reports what would be released; `--force` ignores the age threshold and is for confirmed incidents only. The command never touches deployments that are still progressing: it requires the record to be older than the threshold, marks it `failed` with a fixed safe message and clears the reservation. See docs/troubleshooting.md for manual recovery.

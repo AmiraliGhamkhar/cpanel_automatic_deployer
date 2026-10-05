@@ -5,6 +5,8 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 
+# One job on purpose: hosted runners are scarce for this repository, and a
+# second parallel job starves until the 15-minute acquisition timeout kills it.
 jobs:
   php:
     runs-on: ubuntu-latest
@@ -15,20 +17,14 @@ jobs:
           php-version: '8.4'
           extensions: curl, intl, mbstring, pdo_sqlite, pdo_pgsql, openssl, zip
           coverage: none
-      - name: Cache Composer packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.composer/cache
-          key: composer-${{ hashFiles('composer.lock') }}
-          restore-keys: composer-
       - run: composer install --no-interaction --prefer-dist
       - run: composer validate --strict
       - run: php tests/security-smoke.php
-      - run: mkdir -p database storage/framework/{cache/data,sessions,views} storage/logs
       - name: Boot the application the way production does
         run: |
           cp .env.example .env
           php artisan key:generate --force
+          mkdir -p database storage/framework/{cache/data,sessions,views} storage/logs
           touch database/control.sqlite
           php artisan migrate --force --database=sqlite
           php artisan config:cache
@@ -47,22 +43,11 @@ jobs:
           QUEUE_CONNECTION: database
           CACHE_STORE: database
           SESSION_SECURE_COOKIE: 'false'
-      - name: Run the test suite
+      - name: Control-plane test suite
         run: composer test -- --log-junit test-results.xml 2>&1 | tee phpunit-output.log
-      - name: Report PHPUnit results
+      - name: Report control-plane results
         if: always()
         run: php tests/report-ci.php test-results.xml phpunit-output.log
-
-  integration:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.4'
-          extensions: curl, intl, mbstring, pdo_sqlite, openssl, zip
-          coverage: none
-      - run: composer install --no-interaction --prefer-dist
       - name: Start a real SSH server
         run: |
           sudo apt-get update -qq
@@ -73,20 +58,26 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys
           sudo ssh-keygen -A
           sudo mkdir -p /run/sshd
+          # Exactly one host key, so the pinned fingerprint is unambiguous.
           sudo /usr/sbin/sshd -p 2222 \
+            -o HostKey=/etc/ssh/ssh_host_ed25519_key \
             -o PasswordAuthentication=no \
             -o PubkeyAuthentication=yes \
             -o PermitRootLogin=no \
             -o AuthorizedKeysFile=.ssh/authorized_keys \
             -o StrictModes=no
+          HOST_KEY=/etc/ssh/ssh_host_ed25519_key.pub
           echo "CONTROL_SSH_TEST_TARGET=127.0.0.1:2222" >> "$GITHUB_ENV"
           echo "CONTROL_SSH_TEST_USER=$(id -un)" >> "$GITHUB_ENV"
-          echo "CONTROL_SSH_TEST_FINGERPRINT=$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 | awk '{print $2}')" >> "$GITHUB_ENV"
+          echo "CONTROL_SSH_TEST_FINGERPRINT=$(ssh-keygen -lf "$HOST_KEY" -E sha256 | awk '{print $2}')" >> "$GITHUB_ENV"
           {
             echo 'CONTROL_SSH_TEST_KEY<<SSHKEY'
             cat ~/.ssh/id_ed25519
             echo 'SSHKEY'
           } >> "$GITHUB_ENV"
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 "$(id -un)@127.0.0.1" 'echo ssh-ready' || true
-      - name: Real SSH, real clone, real rollback
-        run: php vendor/bin/phpunit --testsuite Integration
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 "$(id -un)@127.0.0.1" 'echo ssh-ready'
+      - name: Integration suite (real SSH, real clone, real rollback)
+        run: php vendor/bin/phpunit --testsuite Integration --log-junit integration-results.xml 2>&1 | tee phpunit-integration.log
+      - name: Report integration results
+        if: always()
+        run: php tests/report-ci.php integration-results.xml phpunit-integration.log

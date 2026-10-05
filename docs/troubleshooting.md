@@ -29,6 +29,36 @@ Automatic force-unlock is intentionally absent. A worker killed with SIGKILL, ho
 
 Do not run `queue:retry all` for deployment jobs. They are intentionally single-attempt and do not re-execute terminal deployment records. Diagnose DB connectivity before clearing anything.
 
+## Stale operations
+
+`control:reap` releases operations that were abandoned by a dead worker. Run it from
+cron every few minutes on hosts without a process supervisor:
+
+```cron
+*/5 * * * * cd /path/to/app && php artisan control:reap >> storage/logs/reap.log 2>&1
+```
+
+`php artisan control:reap --dry-run` prints what would be released without changing
+anything; `--force` ignores the age threshold and requires a confirmed incident. The
+command skips operations that are still progressing (see `control.stale_operation_after`
+in `config/control.php`). If the queue worker is healthy, the only rows this command
+should ever report are ones left by a killed worker or a lost database connection —
+investigate before force-releasing.
+
 ## Validation remaining
 
-Composer dependencies could not be resolved in the implementation sandbox, but dependency installation and the PHPUnit suite now run in GitHub Actions. Check the latest CI results, then run `composer install`, `composer test`, and a real browser/Livewire smoke test in your deployment environment before using production secrets. Check published Filament assets and login routes. Generate a lockfile only after successful resolution. Test at least one disposable Iranian hosting account; its jail, PATH, quota, symlink and Passenger behavior cannot be verified by mocks.
+Dependency installation and the full PHPUnit suite run in GitHub Actions: a
+control-plane job plus an integration job that runs against a real `sshd` on the
+runner. That still does not prove provider-specific behaviour. Before using
+production secrets, in your own deployment environment:
+
+1. Run `composer install`, `composer test`, and a real browser/Livewire smoke test.
+   Check published Filament assets and the login route.
+2. Generate and commit a lockfile only after successful resolution
+   (`workflow_dispatch` run of `.github/workflows/lockfile.yml`).
+3. Rehearse one disposable Iranian hosting account end to end: its jail, PATH,
+   quota, symlink/POSIX-rename behaviour and Passenger configuration cannot be
+   verified by mocks or by loopback SSH.
+4. Rehearse a `cpanel_git` project against a real account, including a `.cpanel.yml`
+   task that writes a marker file, to confirm the provider's Git Version Control
+   implementation matches the documented sequence.
