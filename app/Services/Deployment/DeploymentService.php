@@ -1,0 +1,365 @@
+<?php
+namespace App\Services\Deployment;
+use App\Models\{Deployment, Project, User};
+use App\Services\{Audit, HealthCheckEngine};
+use App\Services\Remote\{SshServiceInterface, GitHubService, Command};
+use App\Services\Security\Input;
+use Illuminate\Support\Facades\{DB, Gate};
+use RuntimeException;
+class DeploymentService
+{
+    public function __construct(
+        private SshServiceInterface $ssh,
+        private GitHubService $github,
+        private StrategyRegistry $strategies,
+        private HealthCheckEngine $health,
+        private DeploymentLog $log,
+    ) {}
+    public function trigger(
+        Project $project,
+        User $user,
+        string $branch,
+        ?string $sha,
+        bool $confirmed,
+    ): Deployment {
+        Gate::forUser($user)->authorize("deploy", $project);
+        if (!$confirmed) {
+            throw new RuntimeException(
+                "Explicit deployment confirmation is required.",
+            );
+        }
+        Input::branch($branch);
+        if ($sha) {
+            Input::commit($sha);
+        }
+        return $this->queue($project, $user, "deploy", $branch, $sha, null);
+    }
+    public function queue(
+        Project $project,
+        User $user,
+        string $kind,
+        string $branch,
+        ?string $sha,
+        ?Deployment $target,
+    ): Deployment {
+        Gate::forUser($user)->authorize("deploy", $project);
+        if (!in_array($kind, ["deploy", "rollback"], true)) {
+            throw new RuntimeException("Invalid operation.");
+        }
+        return DB::transaction(function () use (
+            $project,
+            $user,
+            $kind,
+            $branch,
+            $sha,
+            $target,
+        ) {
+            \App\Models\Server::lockForUpdate()->findOrFail(
+                $project->server_id,
+            );
+            $p = Project::lockForUpdate()->findOrFail($project->id);
+            if ($p->active_deployment_id !== null) {
+                throw new RuntimeException(
+                    "Another deployment or maintenance operation is active.",
+                );
+            }
+            $this->validate($p);
+            $d = $p->deployments()->create([
+                "triggered_by" => $user->id,
+                "branch" => $branch,
+                "commit_hash" => $sha,
+                "kind" => $kind,
+                "target_deployment_id" => $target?->id,
+            ]);
+            $p->update(["active_deployment_id" => $d->id]);
+            Audit::record(
+                strtoupper($kind) . "_PROJECT",
+                "queued",
+                $p->id,
+                $p->server_id,
+                $user->id,
+            );
+            \App\Jobs\DeployProjectJob::dispatch($d->id);
+            return $d;
+        });
+    }
+    public function validate(Project $p): void
+    {
+        $s = $p->server;
+        if (!$p->enabled || !$s->enabled) {
+            throw new RuntimeException("Project or server is disabled.");
+        }
+        Input::repository($p->repository_url);
+        Input::branch($p->branch);
+        Input::path($p->remote_path, $s->ssh_username);
+        if ($p->deployment_mode !== "ssh") {
+            throw new RuntimeException(
+                "This host mode is inspection-only; SSH deployment is required.",
+            );
+        }
+        if ($p->release_strategy !== "symlink") {
+            throw new RuntimeException(
+                "In-place deployment is not implemented safely. Use a provider-supported symlink document root.",
+            );
+        }
+        if ($p->project_type === "static" && !empty($p->environment_config)) {
+            throw new RuntimeException(
+                "Static projects must not publish managed secrets. Remove environment values before deploying.",
+            );
+        }
+        if ($p->project_type === "custom") {
+            throw new RuntimeException(
+                "Custom projects require a reviewed strategy implemented in application code.",
+            );
+        }
+        if (
+            !$s->last_health_check_at ||
+            $s->last_health_check_at->lt(now()->subDay())
+        ) {
+            throw new RuntimeException(
+                "Run Test Connection first; capability results must be less than 24 hours old.",
+            );
+        }
+        $required = array_merge(
+            ["ssh", "sftp", "symlink"],
+            $this->strategies->for($p->project_type)->requirements(),
+        );
+        if ($p->settings["build"] ?? false) {
+            $required = array_merge($required, ["node", "npm"]);
+        }
+        foreach ($required as $cap) {
+            if (($s->capabilities[$cap]["status"] ?? "") !== "available") {
+                throw new RuntimeException(
+                    "Unsupported on this host: " . $cap . " is unavailable.",
+                );
+            }
+        }
+        if (
+            in_array($p->project_type, ["node", "python"]) &&
+            ($p->settings["restart"] ?? "none") !== "passenger"
+        ) {
+            throw new RuntimeException(
+                "Node/Python requires a provider-configured Passenger application.",
+            );
+        }
+        if (
+            ($p->settings["restart"] ?? "none") === "passenger" &&
+            ($s->capabilities["cpanel_applications"]["status"] ?? "") !==
+                "available" &&
+            ($s->capabilities["passenger"]["status"] ?? "") !== "available"
+        ) {
+            throw new RuntimeException(
+                "Passenger/Application Manager was not detected.",
+            );
+        }
+    }
+    public function execute(Deployment $d): void
+    {
+        if ($d->status !== "pending") {
+            return;
+        }
+        $p = $d->project;
+        $user = User::findOrFail($d->triggered_by);
+        Gate::forUser($user)->authorize("deploy", $p);
+        if ((int) $p->active_deployment_id !== $d->id) {
+            throw new RuntimeException(
+                "Project operation lock is not owned by this deployment.",
+            );
+        }
+        $d->transition("running");
+        $d->update(["started_at" => now()]);
+        $this->log->step(
+            $d,
+            "Validate configuration",
+            fn() => $this->validate($p),
+        );
+        $this->log->step(
+            $d,
+            "Connect with pinned SSH host key",
+            fn() => $this->ssh->connect($p->server),
+        );
+        $base = $p->remote_path;
+        $this->log->step(
+            $d,
+            "Verify dedicated project directory",
+            function () use ($base, $p) {
+                $this->ssh->run(
+                    Command::initialize(
+                        $base,
+                        $p->id,
+                        $p->server->ssh_username,
+                    ),
+                );
+                $this->ssh->run(Command::prepare($base, $p->id));
+            },
+        );
+        $previous = $p->current_deployment_id
+            ? Deployment::find($p->current_deployment_id)
+            : null;
+        $d->update(["previous_release_path" => $previous?->release_path]);
+        if ($d->kind === "rollback") {
+            $target = app(RollbackDeploymentService::class)->select(
+                $p,
+                (int) $d->target_deployment_id,
+            );
+            $release = $target->release_path;
+            $this->log->step(
+                $d,
+                "Verify rollback release exists",
+                function () use ($release) {
+                    if (!$this->ssh->exists($release)) {
+                        throw new RuntimeException(
+                            "Rollback release is missing.",
+                        );
+                    }
+                },
+            );
+            $d->update([
+                "commit_hash" => $target->commit_hash,
+                "release_path" => $release,
+            ]);
+        } else {
+            $sha = $this->log->step(
+                $d,
+                "Resolve GitHub commit",
+                fn() => $this->github->commit(
+                    $p->repository_url,
+                    $d->branch,
+                    $d->commit_hash,
+                ),
+            );
+            $release = $base . "/releases/" . $d->id;
+            $d->update(["commit_hash" => $sha, "release_path" => $release]);
+            $this->log->step(
+                $d,
+                "Clone and verify branch ancestry",
+                fn() => $this->ssh->run(
+                    Command::clone(
+                        $p->repository_url,
+                        $d->branch,
+                        $sha,
+                        $release,
+                    ),
+                ),
+            );
+            $this->log->step(
+                $d,
+                "Remove Git metadata from served release",
+                fn() => $this->ssh->run(Command::removeGitMetadata($release)),
+            );
+            if ($p->project_type !== "static") {
+                $this->log->step(
+                    $d,
+                    "Write protected environment",
+                    function () use ($p, $base, $release) {
+                        $this->writeEnvironment($p);
+                        $this->ssh->run(
+                            Command::linkEnvironment($base, $release),
+                        );
+                    },
+                );
+            }
+            if ($p->project_type === "laravel") {
+                $this->log->step(
+                    $d,
+                    "Link persistent Laravel storage",
+                    fn() => $this->ssh->run(Command::storage($base, $release)),
+                );
+            }
+            $requirements = $this->ssh->exists($release . "/requirements.txt");
+            foreach (
+                $this->strategies
+                    ->for($p->project_type)
+                    ->steps($p, $requirements)
+                as $title => $operation
+            ) {
+                $this->log->step(
+                    $d,
+                    $title,
+                    fn() => $this->ssh->run(
+                        Command::install($release, $operation),
+                    ),
+                );
+            }
+        }
+        $this->log->step(
+            $d,
+            "Activate release",
+            fn() => $this->ssh->run(Command::activate($base, $release, $p->id)),
+        );
+        // Track the actual filesystem switch even when the subsequent health check fails.
+        $p->update(["current_deployment_id" => $d->id]);
+        $this->log->step(
+            $d,
+            "Apply restart strategy",
+            fn() => $this->restart($p),
+        );
+        $this->log->step($d, "Verify HTTPS health check", function () use ($p) {
+            if (!$this->health->check($p->health_check_url)) {
+                throw new RuntimeException("Health check failed.");
+            }
+        });
+        DB::transaction(function () use ($d, $p) {
+            $d->transition($d->kind === "rollback" ? "rolled_back" : "success");
+            $d->update([
+                "finished_at" => now(),
+                "duration" => (int) $d->started_at->diffInSeconds(now()),
+                "rollback_available" => true,
+            ]);
+            $p->update(["active_deployment_id" => null, "status" => "running"]);
+            Audit::record(
+                strtoupper($d->kind) . "_PROJECT",
+                "success",
+                $p->id,
+                $p->server_id,
+                $d->triggered_by,
+            );
+        });
+    }
+    public function writeEnvironment(Project $p): void
+    {
+        $this->ssh->upload(
+            $p->remote_path . "/shared/.env",
+            \App\Services\EnvironmentFile::encode($p->environment_config ?? []),
+        );
+    }
+    public function restart(Project $p): void
+    {
+        if (($p->settings["restart"] ?? "none") === "passenger") {
+            $this->ssh->run(
+                Command::install($p->remote_path . "/current", "passenger"),
+            );
+        }
+    }
+    public function fail(int $id): void
+    {
+        DB::transaction(function () use ($id) {
+            $d = Deployment::lockForUpdate()->find($id);
+            if (!$d || !in_array($d->status, ["pending", "running"])) {
+                return;
+            }
+            $d->transition("failed");
+            $d->update([
+                "finished_at" => now(),
+                "duration" => $d->started_at
+                    ? (int) $d->started_at->diffInSeconds(now())
+                    : 0,
+                "failure_reason" =>
+                    "Deployment failed. See the last failed step; verify provider limits, runtime and health endpoint.",
+            ]);
+            Project::whereKey($d->project_id)
+                ->where("active_deployment_id", $id)
+                ->update([
+                    "active_deployment_id" => null,
+                    "status" => "failed",
+                ]);
+            Audit::record(
+                strtoupper($d->kind) . "_PROJECT",
+                "failed",
+                $d->project_id,
+                null,
+                $d->triggered_by,
+            );
+        });
+    }
+}

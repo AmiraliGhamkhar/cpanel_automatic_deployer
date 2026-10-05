@@ -1,0 +1,52 @@
+{
+  "name": "personal/cpanel-control",
+  "type": "project",
+  "description": "Personal capability-aware cPanel deployment control plane",
+  "require": {
+    "php": "^8.4",
+    "laravel/framework": "^12.0",
+    "filament/filament": "^3.3",
+    "phpseclib/phpseclib": "^3.0",
+    "ext-curl": "*",
+    "ext-openssl": "*",
+    "ext-mbstring": "*",
+    "ext-intl": "*",
+    "ext-pdo": "*"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.5",
+    "mockery/mockery": "^1.6",
+    "fakerphp/faker": "^1.24",
+    "laravel/pint": "^1.20"
+  },
+  "autoload": {
+    "psr-4": {
+      "App\\": "app/",
+      "Database\\Factories\\": "database/factories/",
+      "Database\\Seeders\\": "database/seeders/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "post-autoload-dump": [
+      "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+      "@php artisan package:discover --ansi",
+      "@php artisan filament:upgrade"
+    ],
+    "test": "@php vendor/bin/phpunit"
+  },
+  "config": {
+    "sort-packages": true,
+    "optimize-autoloader": true,
+    "allow-plugins": {
+      "php-http/discovery": true
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "license": "proprietary"
+}
