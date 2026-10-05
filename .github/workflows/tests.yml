@@ -47,10 +47,11 @@ jobs:
           QUEUE_CONNECTION: database
           CACHE_STORE: database
           SESSION_SECURE_COOKIE: 'false'
-      - run: composer test -- --log-junit test-results.xml
+      - name: Run the test suite
+        run: composer test -- --log-junit test-results.xml 2>&1 | tee phpunit-output.log
       - name: Report PHPUnit results
         if: always()
-        run: php tests/report-ci.php test-results.xml
+        run: php tests/report-ci.php test-results.xml phpunit-output.log
 
   integration:
     runs-on: ubuntu-latest
