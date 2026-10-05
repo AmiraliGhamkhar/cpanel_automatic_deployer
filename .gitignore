@@ -25,3 +25,5 @@
 !/storage/framework/views/
 !/storage/framework/views/.gitignore
 !/storage/logs/.gitignore
+
+/test-results.xml

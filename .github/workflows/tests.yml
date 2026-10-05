@@ -15,4 +15,7 @@ jobs:
       - run: composer install --no-interaction --prefer-dist
       - run: composer validate --strict
       - run: php tests/security-smoke.php
-      - run: composer test
+      - run: composer test -- --log-junit test-results.xml
+      - name: Annotate test failures
+        if: failure()
+        run: php tests/report-ci.php test-results.xml
