@@ -36,6 +36,7 @@ class CapabilityDetector
             "tar",
             "symlink",
             "passenger",
+            "mysqldump",
         ];
         foreach ($names as $name) {
             $result[$name] = [

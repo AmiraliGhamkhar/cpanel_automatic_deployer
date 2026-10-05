@@ -40,11 +40,17 @@ class DeploymentService
         string $kind,
         string $branch,
         ?string $sha,
-        ?Deployment $target,
+        ?Deployment $target = null,
+        ?int $sourceBackupId = null,
     ): Deployment {
         Gate::forUser($user)->authorize("deploy", $project);
-        if (!in_array($kind, ["deploy", "rollback"], true)) {
+        if (!in_array($kind, ["deploy", "rollback", "restore"], true)) {
             throw new RuntimeException("Invalid operation.");
+        }
+        if ($kind === "restore" && !$sourceBackupId) {
+            throw new RuntimeException(
+                "A file restore requires the backup it restores.",
+            );
         }
         // Release an operation abandoned by a dead worker before reporting busy.
         app(\App\Services\Operations\StaleOperationReaper::class)->reap($project);
@@ -55,6 +61,7 @@ class DeploymentService
             $branch,
             $sha,
             $target,
+            $sourceBackupId,
         ) {
             \App\Models\Server::lockForUpdate()->findOrFail(
                 $project->server_id,
@@ -72,10 +79,11 @@ class DeploymentService
                 "commit_hash" => $sha,
                 "kind" => $kind,
                 "target_deployment_id" => $target?->id,
+                "source_backup_id" => $sourceBackupId,
             ]);
             $p->update(["active_deployment_id" => $d->id]);
             Audit::record(
-                strtoupper($kind) . "_PROJECT",
+                self::auditAction($kind),
                 "queued",
                 $p->id,
                 $p->server_id,
@@ -228,6 +236,46 @@ class DeploymentService
                 "commit_hash" => $target->commit_hash,
                 "release_path" => $release,
             ]);
+        } elseif ($d->kind === "restore") {
+            $release = $base . "/releases/" . $d->id;
+            $d->update(["release_path" => $release]);
+            $backup = \App\Models\Backup::find((int) $d->source_backup_id);
+            if (
+                !$backup ||
+                $backup->project_id !== $p->id ||
+                $backup->type !== "files" ||
+                $backup->status !== "success"
+            ) {
+                throw new RuntimeException(
+                    "The selected backup is no longer available for restore.",
+                );
+            }
+            $this->log->step(
+                $d,
+                "Extract backup archive",
+                fn() => $this->ssh->run(
+                    Command::restoreArchive($base, $release, $backup->id),
+                ),
+            );
+            if ($p->project_type !== "static") {
+                $this->log->step(
+                    $d,
+                    "Restore protected environment",
+                    function () use ($p, $base, $release) {
+                        $this->writeEnvironment($p);
+                        $this->ssh->run(
+                            Command::linkEnvironment($base, $release),
+                        );
+                    },
+                );
+            }
+            if ($p->project_type === "laravel") {
+                $this->log->step(
+                    $d,
+                    "Link persistent Laravel storage",
+                    fn() => $this->ssh->run(Command::storage($base, $release)),
+                );
+            }
         } else {
             $sha = $this->log->step(
                 $d,
@@ -355,7 +403,7 @@ class DeploymentService
             ]);
             $p->update(["active_deployment_id" => null, "status" => "running"]);
             Audit::record(
-                strtoupper($d->kind) . "_PROJECT",
+                self::auditAction($d->kind),
                 "success",
                 $p->id,
                 $p->server_id,
@@ -363,6 +411,16 @@ class DeploymentService
             );
         });
     }
+    /** Audit action for an operation kind, so history reads consistently. */
+    public static function auditAction(string $kind): string
+    {
+        return match ($kind) {
+            "rollback" => "ROLLBACK_PROJECT",
+            "restore" => "RESTORE_BACKUP",
+            default => "DEPLOY_PROJECT",
+        };
+    }
+
     /** Short, first-party failure summary for lists; detail lives in failure_detail. */
     public function failureSummary(Deployment $d): string
     {
@@ -413,7 +471,7 @@ class DeploymentService
                     "status" => "failed",
                 ]);
             Audit::record(
-                strtoupper($d->kind) . "_PROJECT",
+                self::auditAction($d->kind),
                 "failed",
                 $d->project_id,
                 null,

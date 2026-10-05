@@ -29,6 +29,7 @@ final class Command
             "tar" => "command -v tar",
             "symlink" => "command -v ln",
             "passenger" => "command -v passenger-config",
+            "mysqldump" => "command -v mysqldump",
         ];
         if (!isset($probes[$name])) {
             throw new \InvalidArgumentException("Unknown diagnostic");
@@ -48,6 +49,164 @@ final class Command
             'ps -u $(id -un) -o args= 2>/dev/null | grep -q -F -- ' .
                 self::q($pattern),
             "Check application process",
+        );
+    }
+
+    /**
+     * Dump one database to a gzipped file using a temporary option file.
+     *
+     * The option file is removed even when the dump fails. Options that vary
+     * between MySQL/MariaDB versions are opt-in and whitelisted.
+     *
+     * @param list<string> $extraOptions
+     */
+    public static function databaseDump(
+        string $base,
+        int $backupId,
+        string $database,
+        string $optionFile,
+        array $extraOptions = [],
+    ): self {
+        \App\Services\Backup\DatabaseCredentials::database($database);
+        \App\Services\Security\Input::path($base);
+        if (
+            !preg_match(
+                "~\A/home/[A-Za-z][A-Za-z0-9_-]{0,31}/[A-Za-z0-9_/-]+/shared/\.mysql-[0-9]+\.cnf\z~D",
+                $optionFile,
+            )
+        ) {
+            throw new \InvalidArgumentException("Invalid option file path");
+        }
+        $allowed = [
+            "--no-tablespaces",
+            "--column-statistics=0",
+            "--set-gtid-purged=OFF",
+            "--skip-comments",
+            "--hex-blob",
+            "--routines",
+            "--triggers",
+            "--events",
+        ];
+        foreach ($extraOptions as $option) {
+            if (!in_array($option, $allowed, true)) {
+                throw new \InvalidArgumentException(
+                    "Unsupported mysqldump option",
+                );
+            }
+        }
+        $out = self::q($base . "/backups/database-" . $backupId . ".sql.gz");
+        $cnf = self::q($optionFile);
+        $extra = $extraOptions === [] ? "" : " " . implode(" ", $extraOptions);
+        // The option file path is restricted to [A-Za-z0-9_/.-] by the guard
+        // above, so it cannot escape the single quotes used by trap.
+        $script =
+            "umask 077; trap 'rm -f " .
+            $optionFile .
+            "' EXIT; test ! -L " .
+            $cnf .
+            " && mysqldump --defaults-extra-file=" .
+            $cnf .
+            " --single-transaction --quick --skip-lock-tables" .
+            $extra .
+            " " .
+            self::q($database) .
+            " | gzip -c > " .
+            $out .
+            " && test -s " .
+            $out;
+        return new self(
+            "cd " . self::q($base) . " && timeout 600 sh -c " . self::q($script),
+            "Dump database",
+        );
+    }
+
+    /** Import a gzipped dump into one database (explicit, confirmed restore). */
+    public static function databaseRestore(
+        string $base,
+        int $backupId,
+        string $database,
+        string $optionFile,
+    ): self {
+        \App\Services\Backup\DatabaseCredentials::database($database);
+        \App\Services\Security\Input::path($base);
+        $dump = self::q($base . "/backups/database-" . $backupId . ".sql.gz");
+        $cnf = self::q($optionFile);
+        $script =
+            "umask 077; trap 'rm -f " .
+            $optionFile .
+            "' EXIT; test ! -L " .
+            $cnf .
+            " && test -s " .
+            $dump .
+            " && gunzip -c " .
+            $dump .
+            " | mysql --defaults-extra-file=" .
+            $cnf .
+            " " .
+            self::q($database);
+        return new self(
+            "cd " . self::q($base) . " && timeout 600 sh -c " . self::q($script),
+            "Restore database",
+        );
+    }
+
+    /** Extract a file backup archive into a fresh, empty release directory. */
+    public static function restoreArchive(
+        string $base,
+        string $release,
+        int $backupId,
+    ): self {
+        \App\Services\Security\Input::path($base);
+        $archive = self::q($base . "/backups/" . $backupId . ".tar.gz");
+        $relative = substr($release, strlen($base) + 1);
+        if (!preg_match("~\Areleases/[0-9]+\z~D", $relative)) {
+            throw new \InvalidArgumentException("Invalid release path");
+        }
+        $target = self::q($release);
+        return new self(
+            "test ! -L " .
+                $archive .
+                " && test -f " .
+                $archive .
+                " && test ! -e " .
+                $target .
+                " && test ! -L " .
+                $target .
+                " && mkdir -p -- " .
+                $target .
+                " && umask 077 && timeout 300 tar -xzf " .
+                $archive .
+                " -C " .
+                $target .
+                " && test -n \"$(ls -A -- " .
+                $target .
+                ")\"",
+            "Extract backup archive",
+        );
+    }
+
+    /** Delete one managed archive. Only files this panel created are addressed. */
+    public static function deleteArchive(
+        string $base,
+        int $backupId,
+        string $type = "files",
+    ): self {
+        \App\Services\Security\Input::path($base);
+        $name = in_array($type, ["files", "database"], true)
+            ? "backups/" . $backupId . ".tar.gz"
+            : null;
+        if ($type === "database") {
+            $name = "backups/database-" . $backupId . ".sql.gz";
+        }
+        if ($name === null) {
+            throw new \InvalidArgumentException("Invalid archive type");
+        }
+        return new self(
+            "test ! -L " .
+                self::q($base . "/" . $name) .
+                " && rm -f -- " .
+                self::q($base . "/" . $name),
+            "Delete archive",
         );
     }
 

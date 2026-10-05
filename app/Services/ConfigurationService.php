@@ -131,6 +131,19 @@ class ConfigurationService
             "settings.health_process" => "nullable|string|max:120",
             "settings.health_attempts" => "nullable|integer|min:1|max:5",
             "settings.health_delay" => "nullable|integer|min:0|max:30",
+            "settings.db_dump_options" => "nullable|array|max:8",
+            "settings.db_dump_options.*" => [
+                Rule::in([
+                    "--no-tablespaces",
+                    "--column-statistics=0",
+                    "--set-gtid-purged=OFF",
+                    "--skip-comments",
+                    "--hex-blob",
+                    "--routines",
+                    "--triggers",
+                    "--events",
+                ]),
+            ],
             "enabled" => "boolean",
         ])->validate();
         $server = Server::findOrFail($data["server_id"]);
@@ -163,6 +176,7 @@ class ConfigurationService
                 "health_process",
                 "health_attempts",
                 "health_delay",
+                "db_dump_options",
             ]),
         );
         if (

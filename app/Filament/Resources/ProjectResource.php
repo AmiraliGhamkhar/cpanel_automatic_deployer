@@ -160,6 +160,13 @@ class ProjectResource extends Resource
                             ? "Maintenance"
                             : "#" . $state,
                     ),
+                C\TextColumn::make("health_checked_at")
+                    ->label("Last health")
+                    ->since()
+                    ->placeholder("Never")
+                    ->description(
+                        fn(Project $record) => $record->health_check_message,
+                    ),
             ])
             ->poll("5s")
             ->actions([
@@ -329,11 +336,23 @@ class ProjectResource extends Resource
                             );
                         }),
                     A\Action::make("backup")
-                        ->requiresConfirmation()
-                        ->modalDescription(
-                            "Archive the active release on this host, excluding .env and .git. Does not include databases or shared uploads. No automatic restore.",
-                        )
-                        ->action(function (Project $record) {
+                        ->form([
+                            F\Select::make("type")
+                                ->label("What to back up")
+                                ->options([
+                                    "files" => "Release files (tar.gz on the host)",
+                                    "database" => "Database dump (mysqldump, needs DB_* variables)",
+                                ])
+                                ->default("files")
+                                ->required(),
+                            F\Checkbox::make("confirmed")
+                                ->label(
+                                    "Confirm backup. File archives exclude .env and .git; database dumps need credentials in the project environment.",
+                                )
+                                ->accepted()
+                                ->required(),
+                        ])
+                        ->action(function (Project $record, array $data) {
                             ActionRunner::run(
                                 fn() => app(
                                     \App\Services\ProjectOperations::class,
@@ -341,7 +360,8 @@ class ProjectResource extends Resource
                                     $record,
                                     auth()->user(),
                                     "backup",
-                                    true,
+                                    (bool) $data["confirmed"],
+                                    (string) $data["type"],
                                 ),
                             );
                         }),
@@ -380,6 +400,38 @@ class ProjectResource extends Resource
                                     $record->id,
                                     $record->server_id,
                                 );
+                            });
+                        }),
+                    A\Action::make("releaseLock")
+                        ->label("Release stuck operation")
+                        ->icon("heroicon-o-lock-open")
+                        ->color("danger")
+                        ->visible(
+                            fn(Project $record) => $record->active_deployment_id !== null,
+                        )
+                        ->modalHeading("Release the active operation lock")
+                        ->modalDescription(
+                            "Use this only when a worker died and the operation is stuck. A deployment that is still running will be marked failed and interrupted; a deployment that is still healthy is not rolled back. Stale operations are released automatically after 45 minutes.",
+                        )
+                        ->form([
+                            F\Checkbox::make("confirmed")
+                                ->label(
+                                    "I understand this marks the active deployment failed and releases the lock.",
+                                )
+                                ->accepted()
+                                ->required(),
+                        ])
+                        ->action(function (Project $record, array $data) {
+                            Gate::authorize("operate", $record);
+                            ActionRunner::run(function () use ($record, $data) {
+                                if (!$data["confirmed"]) {
+                                    throw new \RuntimeException(
+                                        "Confirmation required.",
+                                    );
+                                }
+                                app(
+                                    \App\Services\Operations\StaleOperationReaper::class,
+                                )->reap($record, true, auth()->id());
                             });
                         }),
                     A\EditAction::make(),

@@ -19,19 +19,22 @@ class RecordingSsh implements SshServiceInterface
 
     public bool $exists = true;
 
+    /** @var list<array{path:string,content:string}> */
+    public array $uploads = [];
+
     public function __construct(private string $defaultOutput = "") {}
+
+    public int $connects = 0;
 
     public function connect(Server $server): void
     {
-        $this->commands[] = new Command("ssh connect " . $server->hostname);
+        // A connection is not a command; only run()/upload() are recorded.
+        $this->connects++;
     }
 
     public function run(Command $command): string
     {
-        // connect() records a synthetic command; only real runs are asserted.
-        if ($command->shell !== "" && !str_starts_with($command->shell, "ssh connect")) {
-            $this->commands[] = $command;
-        }
+        $this->commands[] = $command;
         foreach ($this->outputs as $needle => $output) {
             if (str_contains($command->shell, $needle)) {
                 return $output;
@@ -47,7 +50,7 @@ class RecordingSsh implements SshServiceInterface
 
     public function upload(string $path, string $content): void
     {
-        $this->commands[] = new Command("upload " . $path);
+        $this->uploads[] = ["path" => $path, "content" => $content];
     }
 
     public function read(string $path): string
